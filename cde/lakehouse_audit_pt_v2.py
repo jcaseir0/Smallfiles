@@ -83,10 +83,16 @@ def list_files_distributed(spark, df_catalog):
     """
     logger.info("Iniciando listagem física de arquivos no storage (Parallel Scan)...")
 
-    # Usamos o py4j para extrair a configuração como um objeto serializável
-    conf_broadcast = spark.sparkContext.broadcast(
-        spark.sparkContext._jsc.hadoopConfiguration()
-    )
+    # 1. Extraímos as configurações do Hadoop para um dicionário Python (Pickle-friendly)
+    conf_java = spark.sparkContext._jsc.hadoopConfiguration()
+    conf_dict = {}
+    iterator = conf_java.iterator()
+    while iterator.hasNext():
+        item = iterator.next()
+        conf_dict[item.getKey()] = item.getValue()
+
+    # Fazemos o broadcast do dicionário simples
+    conf_broadcast = spark.sparkContext.broadcast(conf_dict)
 
     locations_rdd = df_catalog.select("db_name", "table_name", "location").rdd
 
@@ -95,34 +101,41 @@ def list_files_distributed(spark, df_catalog):
         # Usamos o gateway da JVM que já está disponível no worker
         from pyspark import SparkContext
 
-        # Recuperamos a configuração enviada pelo Driver
-        conf = conf_broadcast.value
+        # Recuperamos o dicionário do broadcast
+        local_conf_dict = conf_broadcast.value
         results = []
 
-        # Precisamos acessar as classes Java diretamente via py4j gateway do worker
-        # O gateway está disponível em SparkContext._gateway
+        # Acessamos o gateway para interagir com o Java
         gateway = SparkContext._gateway
-        Path = gateway.jvm.org.apache.hadoop.fs.Path
-        FileSystem = gateway.jvm.org.apache.hadoop.fs.FileSystem
+        jvm = gateway.jvm
+
+        # Reconstruímos a Configuration do Hadoop dentro do Worker
+        hadoop_conf = jvm.org.apache.hadoop.conf.Configuration()
+        for k, v in local_conf_dict.items():
+            hadoop_conf.set(k, v)
+
+        Path = jvm.org.apache.hadoop.fs.Path
+        FileSystem = jvm.org.apache.hadoop.fs.FileSystem
 
         for row in rows:
             db, table, loc = row
             try:
                 # Criamos o objeto de caminho e pegamos o sistema de arquivos
                 hadoop_path = Path(loc)
-                fs = FileSystem.get(hadoop_path.toUri(), conf)
+                # No Worker, buscamos o FS usando a config reconstruída
+                fs = FileSystem.get(hadoop_path.toUri(), hadoop_conf)
 
                 files_iter = fs.listFiles(hadoop_path, True)
 
                 while files_iter.hasNext():
                     f = files_iter.next()
                     size = f.getLen()
-                    # Small File Rule: < 10MB and > 0
+                    # Regra dos arquivos pequenos: < 10MB and > 0
                     is_small = 1 if 0 < size < SMALL_FILE_THRESHOLD else 0
                     results.append((db, table, loc, size, is_small))
 
             except Exception as e:
-                # Log do erro (aparecerá nos logs do Executor)
+                # Log do erro (O erro de uma tabela não deve parar o mapeamento global)
                 results.append((db, table, loc, -1, 0))
 
         return results
