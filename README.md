@@ -1,4 +1,4 @@
-# Contexto dos arquivos pequenos no HDFS
+# Contexto dos arquivos pequenos no Hadoop
 ## Funcionamento do HDFS NameNode
 
 O HDFS foi desenvolvido para tratar eficientemente arquivos grandes, baseado no tamanho do bloco. A plataforma da Cloudera utiliza como padrão o tamanho do bloco com 128MB. Ou seja, é recomendável que os dados ingeridos no cluster sejam tratados e somente ser armazenados com o tamanho igual ou maior do que o tamanho do bloco. No caso de grandes volumes, avaliar também os tamanhos quando utilizar algoritmos de compactação. 

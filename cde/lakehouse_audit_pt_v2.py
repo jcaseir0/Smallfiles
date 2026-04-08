@@ -33,19 +33,41 @@ def get_catalog_metadata(spark):
     databases = spark.catalog.listDatabases()
     all_tables = []
 
+    # Lista de bancos de dados de sistema para ignorar (não possuem arquivos físicos úteis)
+    system_dbs = ["information_schema", "sys", "db_performance"]
+
     for db in databases:
+        if db.name.lower() in system_dbs:
+            logger.info(f"Skipping system database: {db.name}")
+            continue
+
         tables = spark.catalog.listTables(db.name)
         for t in tables:
+            if t.tableType == "VIEW":
+                continue
+
             try:
-                # Describe detail extrai o location físico da tabela (S3/ADLS)
-                details = spark.sql(f"DESCRIBE DETAIL {db.name}.{t.name}").collect()[0]
-                all_tables.append((db.name, t.name, details.location))
-                logger.info(f"Tabela mapeada: {db.name}.{t.name}")
+                # Tentamos o DESCRIBE EXTENDED que é universal para Hive e Iceberg
+                # e extraímos a linha que contém o 'Location'
+                location_df = spark.sql(f"DESCRIBE EXTENDED {db.name}.{t.name}")
+
+                # O Spark retorna uma tabela com colunas col_name, data_type, comment
+                # Procuramos pela linha onde col_name é 'Location'
+                location_row = location_df.filter(
+                    F.col("col_name") == "Location"
+                ).collect()
+
+                if location_row:
+                    loc = location_row[0].data_type
+                    all_tables.append((db.name, t.name, loc))
+                    logger.info(f"Table mapped: {db.name}.{t.name} -> {loc}")
+                else:
+                    logger.warning(f"Location not found for table: {db.name}.{t.name}")
+
             except Exception as e:
                 logger.error(
-                    f"Skipping table {db.name}.{t.name} due to missing SerDe/StorageHandler: {str(e)}"
+                    f"Skipping table {db.name}.{t.name} due to metadata error: {str(e)}"
                 )
-                continue
 
     schema = ["db_name", "table_name", "location"]
     return spark.createDataFrame(all_tables, schema)
