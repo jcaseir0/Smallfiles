@@ -38,7 +38,7 @@ def get_catalog_metadata(spark):
 
     for db in databases:
         if db.name.lower() in system_dbs:
-            logger.info(f"Skipping system database: {db.name}")
+            logger.info(f"Ignorar a base de dados do sistema: {db.name}")
             continue
 
         tables = spark.catalog.listTables(db.name)
@@ -62,11 +62,13 @@ def get_catalog_metadata(spark):
                     all_tables.append((db.name, t.name, loc))
                     logger.info(f"Table mapped: {db.name}.{t.name} -> {loc}")
                 else:
-                    logger.warning(f"Location not found for table: {db.name}.{t.name}")
+                    logger.warning(
+                        f"Não foi encontrada a localização para a tabela: {db.name}.{t.name}"
+                    )
 
             except Exception as e:
                 logger.error(
-                    f"Skipping table {db.name}.{t.name} due to metadata error: {str(e)}"
+                    f"Ignorar tabela {db.name}.{t.name} devido a um erro de metadados: {str(e)}"
                 )
 
     schema = ["db_name", "table_name", "location"]
@@ -128,9 +130,13 @@ def list_files_distributed(spark, df_catalog):
 
 
 def aggregate_and_save(df_raw):
-    """Consolida as métricas por tabela e persiste em formato Iceberg."""
-    logger.info("Agregando métricas e calculando percentuais de saúde...")
+    """
+    Consolida as métricas por tabela e armazena-as no formato Iceberg.
+    Assegura que a base de dados e a tabela de destino são criadas, caso não existam.
+    """
+    logger.info("Agregar métricas e calcular percentagens de integridade...")
 
+    # Logic for metrics calculation
     df_metrics = (
         df_raw.groupBy("db_name", "table_name", "location")
         .agg(
@@ -146,9 +152,25 @@ def aggregate_and_save(df_raw):
         )
     )
 
-    logger.info(f"Persistindo resultados na tabela {TARGET_TABLE}...")
-    df_metrics.write.format("iceberg").mode("append").save(TARGET_TABLE)
-    logger.info("Processo de auditoria finalizado com sucesso.")
+    # Infrastructure preparation
+    try:
+        # Extract database name from TARGET_TABLE (e.g., 'sys_monitoring')
+        target_db = TARGET_TABLE.split(".")[0]
+
+        logger.info(f"Verificar se a base de dados {target_db} existe...")
+        spark.sql(f"CREATE DATABASE IF NOT EXISTS {target_db}")
+
+        logger.info(f"Guardar os resultados na tabela {TARGET_TABLE}...")
+
+        # Using saveAsTable instead of save to register the table in the Metastore
+        # Iceberg format will handle the schema and metadata automatically
+        df_metrics.write.format("iceberg").mode("append").saveAsTable(TARGET_TABLE)
+
+        logger.info("O processo de auditoria foi concluído com sucesso.")
+
+    except Exception as e:
+        logger.error(f"Erro crítico durante a agregação e salvamento: {str(e)}")
+        raise
 
 
 if __name__ == "__main__":
