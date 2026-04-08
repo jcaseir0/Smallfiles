@@ -78,8 +78,8 @@ def get_catalog_metadata(spark):
 def list_files_distributed(spark, df_catalog):
     """
     Lógica principal de listagem distribuída.
-    Utiliza a API do Hadoop FileSystem dentro de um RDD para paralelizar
-    o acesso ao storage entre os Executors.
+    Utiliza um dicionário de configuração serializável e
+    acede diretamente ao gateway py4j local do Worker.
     """
     logger.info("Iniciando listagem física de arquivos no storage (Parallel Scan)...")
 
@@ -97,49 +97,59 @@ def list_files_distributed(spark, df_catalog):
     locations_rdd = df_catalog.select("db_name", "table_name", "location").rdd
 
     def process_partition(rows):
-        """Função executada dentro de cada Executor do Spark."""
+        """
+        Capturamos o Gateway Py4J que o Spark inicializa no Worker automaticamente
+        """
         # Usamos o gateway da JVM que já está disponível no worker
-        from pyspark import SparkContext
+        try:
+            from py4j.java_gateway import java_import
 
-        # Recuperamos o SparkContext do Worker e a JVM
-        sc = SparkContext.getOrCreate()
-        # O segredo: Acessar a JVM via _jvm do contexto local do Worker
-        jvm = sc._jvm
+            # O Spark expõe a JVM nos workers através desse objeto interno
+            import sys
 
-        # Reconstruímos a Configuration do Hadoop dentro do Worker
+            # Acessamos a JVM local do processo Worker
+            # No Spark, o gateway padrão nos workers é acessível via:
+            from pyspark.java_gateway import launch_gateway
+
+            # No entanto, em Workers CDE, o método mais seguro é instanciar a Config diretamente
+            # via py4j bridge se disponível, ou usar o objeto de sistema.
+        except ImportError:
+            pass
+
+        # Abordagem robusta para CDE: Reconstrução manual via gateway interno
+        import pyspark
+
+        gateway = pyspark.java_gateway.launch_gateway()
+        jvm = gateway.jvm
+
+        # Reconstruímos a configuração Hadoop
         hadoop_conf = jvm.org.apache.hadoop.conf.Configuration()
         for k, v in conf_broadcast.value.items():
             hadoop_conf.set(k, v)
 
-        # Atalhos para as classes Java do Hadoop
         Path = jvm.org.apache.hadoop.fs.Path
         FileSystem = jvm.org.apache.hadoop.fs.FileSystem
 
         results = []
         for row in rows:
             db, table, loc = row
-            if not loc:
-                continue  # Ignorar tabelas sem localização definida
+            if not loc or loc == "None":
+                continue
+
             try:
-                # Criamos o objeto de caminho e pegamos o sistema de arquivos
-                hadoop_path = Path(loc)
-                # No Worker, buscamos o FS usando a config reconstruída
-                fs = FileSystem.get(hadoop_path.toUri(), hadoop_conf)
+                h_path = Path(loc)
+                fs = FileSystem.get(h_path.toUri(), hadoop_conf)
 
-                if fs.exists(hadoop_path):
-                    files_iter = fs.listFiles(hadoop_path, True)
-
+                if fs.exists(h_path):
+                    files_iter = fs.listFiles(h_path, True)
                     while files_iter.hasNext():
                         f = files_iter.next()
                         size = f.getLen()
-                        # Regra dos arquivos pequenos: < 10MB and > 0
                         is_small = 1 if 0 < size < SMALL_FILE_THRESHOLD else 0
                         results.append((db, table, loc, size, is_small))
-                    else:
-                        results.append((db, table, loc, -2, 0))  # Directory not found
-
-            except Exception as e:
-                # Log do erro (O erro de uma tabela não deve parar o mapeamento global)
+                else:
+                    results.append((db, table, loc, -2, 0))
+            except Exception:
                 results.append((db, table, loc, -1, 0))
 
         return results
