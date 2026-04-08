@@ -83,33 +83,46 @@ def list_files_distributed(spark, df_catalog):
     """
     logger.info("Iniciando listagem física de arquivos no storage (Parallel Scan)...")
 
+    # Usamos o py4j para extrair a configuração como um objeto serializável
+    conf_broadcast = spark.sparkContext.broadcast(
+        spark.sparkContext._jsc.hadoopConfiguration()
+    )
+
     locations_rdd = df_catalog.select("db_name", "table_name", "location").rdd
 
     def process_partition(rows):
         """Função executada dentro de cada Executor do Spark."""
-        # Acesso ao JVM do Hadoop via PySpark Bridge
-        sc_context = SparkSession.builder.getOrCreate().sparkContext
-        conf = sc_context._jsc.hadoopConfiguration()
+        # Usamos o gateway da JVM que já está disponível no worker
+        from pyspark import SparkContext
+
+        # Recuperamos a configuração enviada pelo Driver
+        conf = conf_broadcast.value
         results = []
+
+        # Precisamos acessar as classes Java diretamente via py4j gateway do worker
+        # O gateway está disponível em SparkContext._gateway
+        gateway = SparkContext._gateway
+        Path = gateway.jvm.org.apache.hadoop.fs.Path
+        FileSystem = gateway.jvm.org.apache.hadoop.fs.FileSystem
 
         for row in rows:
             db, table, loc = row
             try:
-                path = sc_context._gateway.jvm.org.apache.hadoop.fs.Path(loc)
-                fs = path.getFileSystem(conf)
-                files_iter = fs.listFiles(path, True)  # True = Recursivo
+                # Criamos o objeto de caminho e pegamos o sistema de arquivos
+                hadoop_path = Path(loc)
+                fs = FileSystem.get(hadoop_path.toUri(), conf)
 
-                count = 0
+                files_iter = fs.listFiles(hadoop_path, True)
+
                 while files_iter.hasNext():
                     f = files_iter.next()
                     size = f.getLen()
-                    # Regra de Small File: menor que 10MB e maior que 0 (ignora metadados)
+                    # Small File Rule: < 10MB and > 0
                     is_small = 1 if 0 < size < SMALL_FILE_THRESHOLD else 0
                     results.append((db, table, loc, size, is_small))
-                    count += 1
 
             except Exception as e:
-                # Log de erro silencioso para não quebrar o Job inteiro
+                # Log do erro (aparecerá nos logs do Executor)
                 results.append((db, table, loc, -1, 0))
 
         return results
