@@ -101,38 +101,42 @@ def list_files_distributed(spark, df_catalog):
         # Usamos o gateway da JVM que já está disponível no worker
         from pyspark import SparkContext
 
-        # Recuperamos o dicionário do broadcast
-        local_conf_dict = conf_broadcast.value
-        results = []
-
-        # Acessamos o gateway para interagir com o Java
-        gateway = SparkContext._gateway
-        jvm = gateway.jvm
+        # Recuperamos o SparkContext do Worker e a JVM
+        sc = SparkContext.getOrCreate()
+        # O segredo: Acessar a JVM via _jvm do contexto local do Worker
+        jvm = sc._jvm
 
         # Reconstruímos a Configuration do Hadoop dentro do Worker
         hadoop_conf = jvm.org.apache.hadoop.conf.Configuration()
-        for k, v in local_conf_dict.items():
+        for k, v in conf_broadcast.value.items():
             hadoop_conf.set(k, v)
 
+        # Atalhos para as classes Java do Hadoop
         Path = jvm.org.apache.hadoop.fs.Path
         FileSystem = jvm.org.apache.hadoop.fs.FileSystem
 
+        results = []
         for row in rows:
             db, table, loc = row
+            if not loc:
+                continue  # Ignorar tabelas sem localização definida
             try:
                 # Criamos o objeto de caminho e pegamos o sistema de arquivos
                 hadoop_path = Path(loc)
                 # No Worker, buscamos o FS usando a config reconstruída
                 fs = FileSystem.get(hadoop_path.toUri(), hadoop_conf)
 
-                files_iter = fs.listFiles(hadoop_path, True)
+                if fs.exists(hadoop_path):
+                    files_iter = fs.listFiles(hadoop_path, True)
 
-                while files_iter.hasNext():
-                    f = files_iter.next()
-                    size = f.getLen()
-                    # Regra dos arquivos pequenos: < 10MB and > 0
-                    is_small = 1 if 0 < size < SMALL_FILE_THRESHOLD else 0
-                    results.append((db, table, loc, size, is_small))
+                    while files_iter.hasNext():
+                        f = files_iter.next()
+                        size = f.getLen()
+                        # Regra dos arquivos pequenos: < 10MB and > 0
+                        is_small = 1 if 0 < size < SMALL_FILE_THRESHOLD else 0
+                        results.append((db, table, loc, size, is_small))
+                    else:
+                        results.append((db, table, loc, -2, 0))  # Directory not found
 
             except Exception as e:
                 # Log do erro (O erro de uma tabela não deve parar o mapeamento global)
