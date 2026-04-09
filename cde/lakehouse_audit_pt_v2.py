@@ -34,15 +34,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Configurações Globais
-SMALL_FILE_THRESHOLD = 10 * 1024 * 1024  # 10MB em Bytes
+# --- VARIÁVEIS GLOBAIS ---
+SMALL_FILE_SIZE_MB = 10  # <--- Altere aqui o tamanho em MB para definir "Small File"
 TARGET_TABLE = "sys_monitoring.lakehouse_health_history"
+
+# Cálculo automático do threshold em Bytes para o Spark
+SMALL_FILE_THRESHOLD_BYTES = SMALL_FILE_SIZE_MB * 1024 * 1024
 
 
 def get_spark_session():
     """Inicializa a Spark Session com suporte a Hive e Iceberg."""
     return (
-        SparkSession.builder.appName("Lakehouse-Health-Audit-Production")
+        SparkSession.builder.appName("Lakehouse-Metadata-Audit-Production")
         .enableHiveSupport()
         .getOrCreate()
     )
@@ -181,6 +184,9 @@ def list_files_distributed(spark, df_catalog):
     # Fazemos o broadcast do dicionário simples
     conf_broadcast = spark.sparkContext.broadcast(conf_dict)
 
+    # Broadcast do threshold para os workers
+    threshold_broadcast = spark.sparkContext.broadcast(SMALL_FILE_THRESHOLD_BYTES)
+
     locations_rdd = df_catalog.select("db_name", "table_name", "location").rdd
 
     def process_partition(rows):
@@ -216,6 +222,7 @@ def list_files_distributed(spark, df_catalog):
 
         Path = jvm.org.apache.hadoop.fs.Path
         FileSystem = jvm.org.apache.hadoop.fs.FileSystem
+        current_threshold = threshold_broadcast.value
 
         results = []
         for row in rows:
@@ -232,7 +239,7 @@ def list_files_distributed(spark, df_catalog):
                     while files_iter.hasNext():
                         f = files_iter.next()
                         size = f.getLen()
-                        is_small = 1 if 0 < size < SMALL_FILE_THRESHOLD else 0
+                        is_small = 1 if 0 < size < current_threshold else 0
                         results.append((db, table, loc, size, is_small))
                 else:
                     results.append((db, table, loc, -2, 0))
