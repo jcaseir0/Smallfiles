@@ -18,11 +18,11 @@
 # CREATED: 2024-06-01
 # LAST MODIFIED: 2024-06-01
 # ---------------------------------------------------------------------------------
-# VERSION: 2.1
+# VERSION: 2.4
 # DESCRIPTION: Lakehouse Health & Metadata Audit for Cloudera Data Engineering.
 # ---------------------------------------------------------------------------------
 
-import logging
+import logging, sys
 from datetime import datetime
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
@@ -34,12 +34,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- VARIÁVEIS GLOBAIS ---
-SMALL_FILE_SIZE_MB = 10  # <--- Altere aqui o tamanho em MB para definir "Small File"
+# --- VARIÁVEIS GLOBAIS PADRÃO ---
+DEFAULT_SMALL_FILE_SIZE_MB = 5
 TARGET_TABLE = "sys_monitoring.lakehouse_health_history"
-
-# Cálculo automático do threshold em Bytes para o Spark
-SMALL_FILE_THRESHOLD_BYTES = SMALL_FILE_SIZE_MB * 1024 * 1024
 
 
 def get_spark_session():
@@ -49,6 +46,27 @@ def get_spark_session():
         .enableHiveSupport()
         .getOrCreate()
     )
+
+
+def get_small_file_threshold():
+    """
+    Lê o tamanho do arquivo pequeno a partir dos argumentos do Job (CDE).
+    Se não informado ou inválido, retorna o padrão de 5MB.
+    """
+    if len(sys.argv) > 1:
+        try:
+            val = int(sys.argv[1])
+            logger.info(f"Variável recebida via argumento: {val}MB")
+            return val
+        except ValueError:
+            logger.warning(
+                f"Argumento inválido: {sys.argv[1]}. Usando padrão de {DEFAULT_SMALL_FILE_SIZE_MB}MB"
+            )
+
+    logger.info(
+        f"Nenhum argumento fornecido. Usando tamanho padrão: {DEFAULT_SMALL_FILE_SIZE_MB}MB"
+    )
+    return DEFAULT_SMALL_FILE_SIZE_MB
 
 
 def get_catalog_metadata(spark):
@@ -169,7 +187,7 @@ def get_catalog_metadata(spark):
     return spark.createDataFrame(all_tables_metadata, schema=catalog_schema)
 
 
-def list_files_distributed(spark, df_catalog):
+def list_files_distributed(spark, df_catalog, SMALL_FILE_THRESHOLD_BYTES):
     """
     Lógica principal de listagem distribuída.
     Utiliza um dicionário de configuração serializável e
@@ -339,11 +357,15 @@ if __name__ == "__main__":
     try:
         spark = get_spark_session()
 
+        # Define o tamanho dinamicamente
+        SMALL_FILE_SIZE_MB = get_small_file_threshold()
+        SMALL_FILE_THRESHOLD_BYTES = SMALL_FILE_SIZE_MB * 1024 * 1024
+
         # Passo 1: Catálogo
         df_meta = get_catalog_metadata(spark)
 
         # Passo 2: Listagem Física
-        df_files = list_files_distributed(spark, df_meta)
+        df_files = list_files_distributed(spark, df_meta, SMALL_FILE_THRESHOLD_BYTES)
 
         # Passo 3: Agregação e Escrita
         aggregate_and_save(df_files, df_meta)
