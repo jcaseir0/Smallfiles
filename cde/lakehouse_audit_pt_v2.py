@@ -18,7 +18,7 @@
 # CREATED: 2024-06-01
 # LAST MODIFIED: 2024-06-01
 # ---------------------------------------------------------------------------------
-# VERSION: 2.0
+# VERSION: 2.1
 # DESCRIPTION: Lakehouse Health & Metadata Audit for Cloudera Data Engineering.
 # ---------------------------------------------------------------------------------
 
@@ -26,7 +26,7 @@ import logging
 from datetime import datetime
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.types import StructType, StructField, StringType, LongType
+from pyspark.sql.types import StructType, StructField, StringType, LongType, DoubleType
 
 # 1. Configuração de Logging (Melhor prática para Verbose no CDE)
 logging.basicConfig(
@@ -54,6 +54,25 @@ def get_catalog_metadata(spark):
     Utiliza o spark.catalog para garantir compatibilidade com SDX.
     """
     logger.info("Iniciando coleta de metadados do catálogo (HMS)...")
+
+    # DEFINIÇÃO EXPLÍCITA DO SCHEMA
+    catalog_schema = StructType(
+        [
+            StructField("db_name", StringType(), True),
+            StructField("table_name", StringType(), True),
+            StructField("location", StringType(), True),
+            StructField("owner", StringType(), True),
+            StructField("create_time", StringType(), True),
+            StructField("last_access", StringType(), True),
+            StructField("metadata_location", StringType(), True),
+            StructField("num_rows", StringType(), True),
+            StructField("table_type", StringType(), True),
+            StructField("uuid", StringType(), True),
+            StructField("partitioning_type", StringType(), True),
+            StructField("partitioning_cols", StringType(), True),
+        ]
+    )
+
     databases = spark.catalog.listDatabases()
     all_tables_metadata = []
 
@@ -123,27 +142,28 @@ def get_catalog_metadata(spark):
                     part_cols = f"{buckets} buckets over ({b_cols})"
 
                 all_tables_metadata.append(
-                    {
-                        "db_name": db.name,
-                        "table_name": t.name,
-                        "location": loc,
-                        "owner": owner,
-                        "create_time": create_time,
-                        "last_access": last_access,
-                        "metadata_location": meta_loc,
-                        "num_rows": num_rows,
-                        "table_type": t_type,
-                        "uuid": uuid,
-                        "partitioning_type": part_type,
-                        "partitioning_cols": part_cols,
-                    }
+                    (
+                        db.name,
+                        t.name,
+                        loc,
+                        owner,
+                        create_time,
+                        last_access,
+                        meta_loc,
+                        str(num_rows) if num_rows else None,
+                        t_type,
+                        uuid,
+                        part_type,
+                        part_cols,
+                    )
                 )
                 logger.info(f"Metadados extraídos: {db.name}.{t.name}")
 
             except Exception as e:
                 logger.error(f"Erro ao mapear {db.name}.{t.name}: {str(e)}")
 
-    return spark.createDataFrame(all_tables_metadata)
+    # Criando o DataFrame com o schema fornecido explicitamente
+    return spark.createDataFrame(all_tables_metadata, schema=catalog_schema)
 
 
 def list_files_distributed(spark, df_catalog):
@@ -156,11 +176,7 @@ def list_files_distributed(spark, df_catalog):
 
     # 1. Extraímos as configurações do Hadoop para um dicionário Python (Pickle-friendly)
     conf_java = spark.sparkContext._jsc.hadoopConfiguration()
-    conf_dict = {}
-    iterator = conf_java.iterator()
-    while iterator.hasNext():
-        item = iterator.next()
-        conf_dict[item.getKey()] = item.getValue()
+    conf_dict = {item.getKey(): item.getValue() for item in conf_java.iterator()}
 
     # Fazemos o broadcast do dicionário simples
     conf_broadcast = spark.sparkContext.broadcast(conf_dict)
@@ -294,13 +310,13 @@ if __name__ == "__main__":
         spark = get_spark_session()
 
         # Passo 1: Catálogo
-        df_cat = get_catalog_metadata(spark)
+        df_meta = get_catalog_metadata(spark)
 
         # Passo 2: Listagem Física
-        df_files = list_files_distributed(spark, df_cat)
+        df_files = list_files_distributed(spark, df_meta)
 
         # Passo 3: Agregação e Escrita
-        aggregate_and_save(df_files)
+        aggregate_and_save(df_files, df_meta)
 
         duration = datetime.now() - start_time
         logger.info(f"=== JOB CONCLUÍDO EM {duration} ===")

@@ -18,7 +18,7 @@
 # CREATED: 2024-06-01
 # LAST MODIFIED: 2024-06-01
 # ---------------------------------------------------------------------------------
-# VERSION: 1.0
+# VERSION: 1.1
 # DESCRIPTION: Lakehouse Health & Metadata Audit for Cloudera Data Engineering.
 # ---------------------------------------------------------------------------------
 
@@ -26,22 +26,15 @@ import logging
 from datetime import datetime
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.types import (
-    StructType,
-    StructField,
-    StringType,
-    LongType,
-    DoubleType,
-    TimestampType,
-)
+from pyspark.sql.types import StructType, StructField, StringType, LongType, DoubleType
 
-# 1. Logging Configuration
+# Logging Config
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-# Global Settings
+# Globals
 SMALL_FILE_THRESHOLD = 10 * 1024 * 1024  # 10MB
 TARGET_TABLE = "sys_monitoring.lakehouse_health_history"
 
@@ -56,13 +49,31 @@ def get_spark_session():
 
 def get_catalog_metadata(spark):
     """
-    Collects detailed metadata (Owner, Partitioning, Type, UUID)
-    by parsing DESCRIBE EXTENDED and spark.catalog.
+    Collects detailed metadata using an explicit schema to avoid inference errors.
     """
     logger.info("Starting detailed metadata collection from catalog...")
+
+    # DEFINIÇÃO EXPLÍCITA DO SCHEMA (Resolve o erro CANNOT_DETERMINE_TYPE)
+    catalog_schema = StructType(
+        [
+            StructField("db_name", StringType(), True),
+            StructField("table_name", StringType(), True),
+            StructField("location", StringType(), True),
+            StructField("owner", StringType(), True),
+            StructField("create_time", StringType(), True),
+            StructField("last_access", StringType(), True),
+            StructField("metadata_location", StringType(), True),
+            StructField("num_rows", StringType(), True),
+            StructField("table_type", StringType(), True),
+            StructField("uuid", StringType(), True),
+            StructField("partitioning_type", StringType(), True),
+            StructField("partitioning_cols", StringType(), True),
+        ]
+    )
+
     databases = spark.catalog.listDatabases()
     all_tables_metadata = []
-    system_dbs = ["information_schema", "sys", "db_performance", "information_schema"]
+    system_dbs = ["information_schema", "sys", "db_performance"]
 
     for db in databases:
         if db.name.lower() in system_dbs:
@@ -74,7 +85,6 @@ def get_catalog_metadata(spark):
                 continue
 
             try:
-                # Get raw text metadata
                 desc_df = spark.sql(f"DESCRIBE EXTENDED {db.name}.{t.name}")
                 raw_meta = {
                     row["col_name"]: row["data_type"] for row in desc_df.collect()
@@ -86,7 +96,7 @@ def get_catalog_metadata(spark):
                         default,
                     )
 
-                # Metadata Extraction
+                # Extracting Fields
                 loc = get_meta("Location")
                 owner = get_meta("Owner")
                 create_time = get_meta("Created Time") or get_meta("CreateTime")
@@ -96,7 +106,7 @@ def get_catalog_metadata(spark):
                 t_type = get_meta("Table Type")
                 uuid = get_meta("Table UUID") or get_meta("uuid")
 
-                # Partitioning/Bucketing Logic
+                # Partitioning Logic
                 part_type = "NONE"
                 part_cols = None
 
@@ -117,30 +127,31 @@ def get_catalog_metadata(spark):
                     part_cols = f"{buckets} buckets over ({b_cols})"
 
                 all_tables_metadata.append(
-                    {
-                        "db_name": db.name,
-                        "table_name": t.name,
-                        "location": loc,
-                        "owner": owner,
-                        "create_time": create_time,
-                        "last_access": last_access,
-                        "metadata_location": meta_loc,
-                        "num_rows": str(num_rows) if num_rows else None,
-                        "table_type": t_type,
-                        "uuid": uuid,
-                        "partitioning_type": part_type,
-                        "partitioning_cols": part_cols,
-                    }
+                    (
+                        db.name,
+                        t.name,
+                        loc,
+                        owner,
+                        create_time,
+                        last_access,
+                        meta_loc,
+                        str(num_rows) if num_rows else None,
+                        t_type,
+                        uuid,
+                        part_type,
+                        part_cols,
+                    )
                 )
             except Exception as e:
                 logger.error(f"Error mapping {db.name}.{t.name}: {str(e)}")
 
-    return spark.createDataFrame(all_tables_metadata)
+    # Criando o DataFrame com o schema fornecido explicitamente
+    return spark.createDataFrame(all_tables_metadata, schema=catalog_schema)
 
 
 def list_files_distributed(spark, df_catalog):
     """
-    Distributed file scan using mapPartitions and JVM Gateway bypass.
+    Distributed file scan using mapPartitions.
     """
     logger.info("Broadcasting Hadoop configuration and starting physical scan...")
 
@@ -153,7 +164,6 @@ def list_files_distributed(spark, df_catalog):
     def process_partition(rows):
         import pyspark
 
-        # Launch internal gateway to bypass SparkContext restrictions on workers
         gateway = pyspark.java_gateway.launch_gateway()
         jvm = gateway.jvm
 
@@ -228,7 +238,6 @@ def aggregate_and_save(df_raw_files, df_catalog_meta):
 if __name__ == "__main__":
     spark = get_spark_session()
 
-    # Execution steps
     df_meta = get_catalog_metadata(spark)
     df_files = list_files_distributed(spark, df_meta)
     aggregate_and_save(df_files, df_meta)
