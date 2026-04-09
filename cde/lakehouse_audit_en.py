@@ -56,18 +56,18 @@ def get_catalog_metadata(spark):
     # DEFINIÇÃO EXPLÍCITA DO SCHEMA (Resolve o erro CANNOT_DETERMINE_TYPE)
     catalog_schema = StructType(
         [
+            StructField("uuid", StringType(), True),
+            StructField("owner", StringType(), True),
             StructField("db_name", StringType(), True),
             StructField("table_name", StringType(), True),
-            StructField("location", StringType(), True),
-            StructField("owner", StringType(), True),
-            StructField("create_time", StringType(), True),
-            StructField("last_access", StringType(), True),
-            StructField("metadata_location", StringType(), True),
-            StructField("num_rows", StringType(), True),
             StructField("table_type", StringType(), True),
-            StructField("uuid", StringType(), True),
             StructField("partitioning_type", StringType(), True),
             StructField("partitioning_cols", StringType(), True),
+            StructField("num_rows", StringType(), True),
+            StructField("location", StringType(), True),
+            StructField("metadata_location", StringType(), True),
+            StructField("create_time", StringType(), True),
+            StructField("last_access", StringType(), True),
         ]
     )
 
@@ -128,20 +128,21 @@ def get_catalog_metadata(spark):
 
                 all_tables_metadata.append(
                     (
+                        uuid,
+                        owner,
                         db.name,
                         t.name,
-                        loc,
-                        owner,
-                        create_time,
-                        last_access,
-                        meta_loc,
-                        str(num_rows) if num_rows else None,
                         t_type,
-                        uuid,
                         part_type,
                         part_cols,
+                        str(num_rows) if num_rows else None,
+                        loc,
+                        meta_loc,
+                        create_time,
+                        last_access,
                     )
                 )
+
             except Exception as e:
                 logger.error(f"Error mapping {db.name}.{t.name}: {str(e)}")
 
@@ -219,6 +220,28 @@ def aggregate_and_save(df_raw_files, df_catalog_meta):
         F.avg("file_size").alias("avg_file_size_bytes"),
     )
 
+    # Define a ordem final desejada das colunas, colocando métricas físicas após os metadados
+    final_column_order = [
+        "uuid",
+        "owner",
+        "db_name",
+        "table_name",
+        "table_type",
+        "partitioning_type",
+        "partitioning_cols",
+        "num_rows",
+        "total_files_count",
+        "total_size_bytes",
+        "small_files_count",
+        "avg_file_size_bytes",
+        "small_files_pct",
+        "location",
+        "metadata_location",
+        "create_time",
+        "last_access",
+        "audit_timestamp",
+    ]
+
     df_final = (
         df_catalog_meta.join(df_physical, ["db_name", "table_name"], "left")
         .withColumn("audit_timestamp", F.current_timestamp())
@@ -226,6 +249,7 @@ def aggregate_and_save(df_raw_files, df_catalog_meta):
             "small_files_pct",
             F.round((F.col("small_files_count") / F.col("total_files_count")) * 100, 2),
         )
+        .select(*final_column_order)  #
     )
 
     target_db = TARGET_TABLE.split(".")[0]
