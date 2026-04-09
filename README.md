@@ -34,5 +34,5 @@ Em face aos possíveis impactos, principalmente de lentidão do cluster, faz-se 
 
 ## Tutoriais
 
-- [On-premises](on-prem-steps.md)
-- [Public cloud](public-cloud-steps.md)
+- [On-premises](tutorials/on-prem-steps.md)
+- [Public cloud](tutorials/public-cloud-steps.md)

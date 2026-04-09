@@ -18,7 +18,7 @@
 # CREATED: 2024-06-01
 # LAST MODIFIED: 2024-06-01
 # ---------------------------------------------------------------------------------
-# VERSION: 2.0
+# VERSION: 1.0
 # DESCRIPTION: Lakehouse Health & Metadata Audit for Cloudera Data Engineering.
 # ---------------------------------------------------------------------------------
 
@@ -55,7 +55,7 @@ def get_catalog_metadata(spark):
     """
     logger.info("Iniciando coleta de metadados do catálogo (HMS)...")
     databases = spark.catalog.listDatabases()
-    all_tables_metadata = []
+    all_tables = []
 
     # Lista de bancos de dados de sistema para ignorar (não possuem arquivos físicos úteis)
     system_dbs = ["information_schema", "sys", "db_performance"]
@@ -72,78 +72,31 @@ def get_catalog_metadata(spark):
 
             try:
                 # Tentamos o DESCRIBE EXTENDED que é universal para Hive e Iceberg
-                # e extraímos o 'Detailed Table Information'
-                desc_df = spark.sql(f"DESCRIBE EXTENDED {db.name}.{t.name}")
+                # e extraímos a linha que contém o 'Location'
+                location_df = spark.sql(f"DESCRIBE EXTENDED {db.name}.{t.name}")
 
-                # Transformamos em dicionário para busca rápida (chave -> valor)
-                raw_meta = {
-                    row["col_name"]: row["data_type"] for row in desc_df.collect()
-                }
+                # O Spark retorna uma tabela com colunas col_name, data_type, comment
+                # Procuramos pela linha onde col_name é 'Location'
+                location_row = location_df.filter(
+                    F.col("col_name") == "Location"
+                ).collect()
 
-                # Função auxiliar para buscar chaves ignorando maiúsculas/minúsculas
-                def get_meta(key, default=None):
-                    return next(
-                        (v for k, v in raw_meta.items() if key.lower() in k.lower()),
-                        default,
+                if location_row:
+                    loc = location_row[0].data_type
+                    all_tables.append((db.name, t.name, loc))
+                    logger.info(f"Table mapped: {db.name}.{t.name} -> {loc}")
+                else:
+                    logger.warning(
+                        f"Não foi encontrada a localização para a tabela: {db.name}.{t.name}"
                     )
 
-                # Extração de Campos Básicos
-                loc = get_meta("Location")
-                owner = get_meta("Owner")
-                create_time = get_meta("Created Time") or get_meta("CreateTime")
-                last_access = get_meta("LastAccessTime")
-                meta_loc = get_meta("metadata_location")
-                num_rows = get_meta("numRows")
-                t_type = get_meta("Table Type")
-                uuid = get_meta("Table UUID") or get_meta("uuid")
-
-                # Lógica de Particionamento / Bucketing
-                part_type = "NONE"
-                part_cols = None
-
-                # Verificamos se há informações de Partição no Describe
-                if (
-                    get_meta("Partition Information")
-                    or "# Partition Information" in raw_meta
-                ):
-                    part_type = "PARTITIONED"
-                    # O Spark lista as partições abaixo da linha '# Partition Information'
-                    # Aqui pegamos as colunas do catálogo diretamente para ser mais preciso
-                    p_cols = [
-                        p.name
-                        for p in spark.catalog.listColumns(t.name, db.name)
-                        if p.isPartition
-                    ]
-                    part_cols = ", ".join(p_cols) if p_cols else None
-
-                elif get_meta("Num Buckets") or "Num Buckets" in raw_meta:
-                    part_type = "BUCKETED"
-                    buckets = get_meta("Num Buckets")
-                    b_cols = get_meta("Bucket Columns")
-                    part_cols = f"{buckets} buckets over ({b_cols})"
-
-                all_tables_metadata.append(
-                    {
-                        "db_name": db.name,
-                        "table_name": t.name,
-                        "location": loc,
-                        "owner": owner,
-                        "create_time": create_time,
-                        "last_access": last_access,
-                        "metadata_location": meta_loc,
-                        "num_rows": num_rows,
-                        "table_type": t_type,
-                        "uuid": uuid,
-                        "partitioning_type": part_type,
-                        "partitioning_cols": part_cols,
-                    }
-                )
-                logger.info(f"Metadados extraídos: {db.name}.{t.name}")
-
             except Exception as e:
-                logger.error(f"Erro ao mapear {db.name}.{t.name}: {str(e)}")
+                logger.error(
+                    f"Ignorar tabela {db.name}.{t.name} devido a um erro de metadados: {str(e)}"
+                )
 
-    return spark.createDataFrame(all_tables_metadata)
+    schema = ["db_name", "table_name", "location"]
+    return spark.createDataFrame(all_tables, schema)
 
 
 def list_files_distributed(spark, df_catalog):
@@ -240,24 +193,22 @@ def list_files_distributed(spark, df_catalog):
     return locations_rdd.mapPartitions(process_partition).toDF(file_schema)
 
 
-def aggregate_and_save(df_raw_files, df_catalog_meta):
+def aggregate_and_save(df_raw):
     """
     Consolida as métricas por tabela e armazena-as no formato Iceberg.
     Assegura que a base de dados e a tabela de destino são criadas, caso não existam.
     """
     logger.info("Agregar métricas e calcular percentagens de integridade...")
 
-    # Agrega os dados físicos por tabela
-    df_physical = df_raw_files.groupBy("db_name", "table_name").agg(
-        F.count("file_size").alias("total_files_count"),
-        F.sum("file_size").alias("total_size_bytes"),
-        F.sum("is_small").alias("small_files_count"),
-        F.avg("file_size").alias("avg_file_size_bytes"),
-    )
-
-    # Join com os metadados do catálogo coletados no início
-    df_final = (
-        df_catalog_meta.join(df_physical, ["db_name", "table_name"], "left")
+    # Logic for metrics calculation
+    df_metrics = (
+        df_raw.groupBy("db_name", "table_name", "location")
+        .agg(
+            F.count("file_size").alias("total_files_count"),
+            F.sum("file_size").alias("total_size_bytes"),
+            F.sum("is_small").alias("small_files_count"),
+            F.avg("file_size").alias("avg_file_size_bytes"),
+        )
         .withColumn("audit_timestamp", F.current_timestamp())
         .withColumn(
             "small_files_pct",
@@ -265,9 +216,9 @@ def aggregate_and_save(df_raw_files, df_catalog_meta):
         )
     )
 
-    # Preparação das infraestruturas de destino
+    # Infrastructure preparation
     try:
-        # Extrair o nome da base de dados de TARGET_TABLE (por exemplo, «sys_monitoring»)
+        # Extract database name from TARGET_TABLE (e.g., 'sys_monitoring')
         target_db = TARGET_TABLE.split(".")[0]
 
         logger.info(f"Verificar se a base de dados {target_db} existe...")
@@ -277,7 +228,7 @@ def aggregate_and_save(df_raw_files, df_catalog_meta):
 
         # Using saveAsTable instead of save to register the table in the Metastore
         # Iceberg format will handle the schema and metadata automatically
-        df_final.write.format("iceberg").mode("append").saveAsTable(TARGET_TABLE)
+        df_metrics.write.format("iceberg").mode("append").saveAsTable(TARGET_TABLE)
 
         logger.info("O processo de auditoria foi concluído com sucesso.")
 
