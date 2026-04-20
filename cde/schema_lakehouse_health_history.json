@@ -1,0 +1,24 @@
+{
+  "table": "lakehouse_health_history",
+  "comment": "Tabela de histórico de auditoria de saúde e metadados do Lakehouse",
+  "fields": [
+    { "name": "uuid", "type": "string", "comment": "Identificador único universal da tabela no catálogo." },
+    { "name": "owner", "type": "string", "comment": "Proprietário da tabela conforme definido no metastore." },
+    { "name": "db_name", "type": "string", "comment": "Nome do banco de dados onde a tabela reside." },
+    { "name": "table_name", "type": "string", "comment": "Nome da tabela auditada." },
+    { "name": "table_type", "type": "string", "comment": "Tipo da tabela (ex: MANAGED, EXTERNAL, ICEBERG)." },
+    { "name": "partitioning_type", "type": "string", "comment": "Tipo de particionamento: PARTITIONED, BUCKETED ou NONE." },
+    { "name": "partitioning_cols", "type": "string", "comment": "Lista de colunas utilizadas para particionamento ou bucketing." },
+    { "name": "num_rows", "type": "string", "comment": "Número de linhas estatísticas registradas no catálogo." },
+    { "name": "total_files_count", "type": "long", "comment": "Quantidade total de arquivos físicos no diretório da tabela." },
+    { "name": "total_size_bytes", "type": "long", "comment": "Tamanho total da tabela em bytes no storage." },
+    { "name": "small_files_count", "type": "long", "comment": "Quantidade de arquivos menores que o limite (threshold) definido." },
+    { "name": "avg_file_size_bytes", "type": "double", "comment": "Tamanho médio dos arquivos da tabela em bytes." },
+    { "name": "small_files_pct", "type": "double", "comment": "Percentual de arquivos pequenos em relação ao total de arquivos." },
+    { "name": "location", "type": "string", "comment": "Caminho físico (S3/ADLS/HDFS) onde os dados estão armazenados." },
+    { "name": "metadata_location", "type": "string", "comment": "Caminho do arquivo de metadados (específico para tabelas Iceberg)." },
+    { "name": "create_time", "type": "string", "comment": "Data e hora de criação da tabela." },
+    { "name": "last_access", "type": "string", "comment": "Data e hora do último acesso registrado." },
+    { "name": "audit_timestamp", "type": "timestamp", "comment": "Carimbo de data/hora de quando esta auditoria foi executada." }
+  ]
+}

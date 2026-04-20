@@ -18,11 +18,11 @@
 # CREATED: 2024-06-01
 # LAST MODIFIED: 2024-06-01
 # ---------------------------------------------------------------------------------
-# VERSION: 2.4
+# VERSION: 2.5
 # DESCRIPTION: Lakehouse Health & Metadata Audit for Cloudera Data Engineering.
 # ---------------------------------------------------------------------------------
 
-import logging, sys
+import logging, sys, os
 from datetime import datetime
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
@@ -39,8 +39,33 @@ DEFAULT_SMALL_FILE_SIZE_MB = 5
 TARGET_TABLE = "sys_monitoring.lakehouse_health_history"
 
 
-def get_spark_session():
-    """Inicializa a Spark Session com suporte a Hive e Iceberg."""
+def get_schema_path(
+    logger: logging.Logger, table_name: str, base_path: str = "/app/mount"
+) -> str:
+    """
+    Obtém o caminho do arquivo de esquema para uma determinada tabela.
+
+    Args:
+        logger (logging.Logger): Instância do Logger.
+        table_name (str): O nome da tabela.
+        base_path (str): O caminho base onde os arquivos de esquema estão armazenados.
+
+    Returns:
+        str: O caminho completo para o arquivo de esquema.
+    """
+    logger.info(f"Obtendo caminho do esquema para a tabela: {table_name}")
+    schema_filename = f"schema_{table_name}.json"
+    return os.path.join(base_path, schema_filename)
+
+
+def get_spark_session() -> SparkSession:
+    """
+    Cria ou obtém a SparkSession configurada com suporte ao Hive.
+
+    Returns:
+        SparkSession: Instância ativa da sessão Spark.
+    """
+    logger.info("Criando SparkSession com suporte ao Hive...")
     return (
         SparkSession.builder.appName("Lakehouse-Metadata-Audit-Production")
         .enableHiveSupport()
@@ -48,11 +73,18 @@ def get_spark_session():
     )
 
 
-def get_small_file_threshold():
+def get_small_file_threshold() -> int:
     """
     Lê o tamanho do arquivo pequeno a partir dos argumentos do Job (CDE).
     Se não informado ou inválido, retorna o padrão de 5MB.
+
+    Returns:
+        int: Tamanho limite em MB para arquivos pequenos.
     """
+    logger.info(
+        "Lendo o tamanho limite para arquivos pequenos a partir dos argumentos do Job..."
+    )
+
     if len(sys.argv) > 1:
         try:
             val = int(sys.argv[1])
@@ -69,10 +101,15 @@ def get_small_file_threshold():
     return DEFAULT_SMALL_FILE_SIZE_MB
 
 
-def get_catalog_metadata(spark):
+def get_catalog_metadata(spark: SparkSession) -> StructType:
     """
-    Lista todas as tabelas e seus respectivos paths (locations).
-    Utiliza o spark.catalog para garantir compatibilidade com SDX.
+    Coleta metadados detalhados do catálogo usando um esquema explícito para evitar erros de inferência.
+
+    Args:
+        spark (SparkSession): Instância ativa da sessão Spark.
+
+    Returns:
+        DataFrame: DataFrame contendo os metadados brutos do catálogo.
     """
     logger.info("Iniciando coleta de metadados do catálogo (HMS)...")
 
@@ -111,8 +148,7 @@ def get_catalog_metadata(spark):
                 continue
 
             try:
-                # Tentamos o DESCRIBE EXTENDED que é universal para Hive e Iceberg
-                # e extraímos o 'Detailed Table Information'
+                # DESCRIBE EXTENDED para extração do 'Detailed Table Information'
                 desc_df = spark.sql(f"DESCRIBE EXTENDED {db.name}.{t.name}")
 
                 # Transformamos em dicionário para busca rápida (chave -> valor)
@@ -147,8 +183,7 @@ def get_catalog_metadata(spark):
                     or "# Partition Information" in raw_meta
                 ):
                     part_type = "PARTITIONED"
-                    # O Spark lista as partições abaixo da linha '# Partition Information'
-                    # Aqui pegamos as colunas do catálogo diretamente para ser mais preciso
+                    # O Spark lista as partições abaixo da linha '# Partition Information' para coleta das colunas do catálogo
                     p_cols = [
                         p.name
                         for p in spark.catalog.listColumns(t.name, db.name)
@@ -187,11 +222,19 @@ def get_catalog_metadata(spark):
     return spark.createDataFrame(all_tables_metadata, schema=catalog_schema)
 
 
-def list_files_distributed(spark, df_catalog, SMALL_FILE_THRESHOLD_BYTES):
+def list_files_distributed(
+    spark: SparkSession, df_catalog, SMALL_FILE_THRESHOLD_BYTES: int
+) -> StructType:
     """
-    Lógica principal de listagem distribuída.
-    Utiliza um dicionário de configuração serializável e
-    acede diretamente ao gateway py4j local do Worker.
+    Realiza a varredura distribuída de arquivos usando mapPartitions e a API Hadoop FileSystem.
+
+    Args:
+        spark (SparkSession): Instância ativa da sessão Spark.
+        df_catalog (DataFrame): DataFrame contendo as localizações das tabelas para varredura.
+        SMALL_FILE_THRESHOLD_BYTES (int): Tamanho limite em bytes para classificação de arquivo pequeno.
+
+    Returns:
+        DataFrame: DataFrame contendo o tamanho e a classificação de cada arquivo identificado.
     """
     logger.info("Iniciando listagem física de arquivos no storage (Parallel Scan)...")
 
@@ -205,12 +248,21 @@ def list_files_distributed(spark, df_catalog, SMALL_FILE_THRESHOLD_BYTES):
     # Broadcast do threshold para os workers
     threshold_broadcast = spark.sparkContext.broadcast(SMALL_FILE_THRESHOLD_BYTES)
 
+    # Convertendo o DataFrame de catálogo para RDD para usar mapPartitions
     locations_rdd = df_catalog.select("db_name", "table_name", "location").rdd
 
-    def process_partition(rows):
+    def process_partition(rows: iter) -> list:
         """
         Capturamos o Gateway Py4J que o Spark inicializa no Worker automaticamente
+
+        Args:
+            rows (iterator): Iterador de linhas contendo (db_name, table_name, location) para cada tabela a ser processada.
+
+        Returns:
+            list: Lista de tuplas contendo (db_name, table_name, location, file_size, is_small) para cada arquivo encontrado.
         """
+        logger.info("Processando partição de arquivos no Worker...")
+
         # Usamos o gateway da JVM que já está disponível no worker
         try:
             from py4j.java_gateway import java_import
@@ -230,7 +282,10 @@ def list_files_distributed(spark, df_catalog, SMALL_FILE_THRESHOLD_BYTES):
         # Abordagem robusta para CDE: Reconstrução manual via gateway interno
         import pyspark
 
+        # O Spark já inicializa um gateway Py4J para cada worker, então podemos reutilizá-lo
         gateway = pyspark.java_gateway.launch_gateway()
+
+        # Acessamos a JVM do Spark diretamente, que já está disponível no worker
         jvm = gateway.jvm
 
         # Reconstruímos a configuração Hadoop
@@ -238,16 +293,22 @@ def list_files_distributed(spark, df_catalog, SMALL_FILE_THRESHOLD_BYTES):
         for k, v in conf_broadcast.value.items():
             hadoop_conf.set(k, v)
 
+        # Agora podemos usar a API Hadoop FileSystem para acessar os arquivos
         Path = jvm.org.apache.hadoop.fs.Path
         FileSystem = jvm.org.apache.hadoop.fs.FileSystem
+
+        # O threshold para arquivos pequenos também é acessado via broadcast
         current_threshold = threshold_broadcast.value
 
+        # Processamos cada linha da partição, listando os arquivos e coletando seus tamanhos
         results = []
         for row in rows:
             db, table, loc = row
             if not loc or loc == "None":
                 continue
 
+            # Log para cada tabela processada (pode ser verboso, mas útil para debugging)
+            logger.info(f"Listando arquivos para {db}.{table} em {loc}...")
             try:
                 h_path = Path(loc)
                 fs = FileSystem.get(h_path.toUri(), hadoop_conf)
@@ -263,7 +324,6 @@ def list_files_distributed(spark, df_catalog, SMALL_FILE_THRESHOLD_BYTES):
                     results.append((db, table, loc, -2, 0))
             except Exception:
                 results.append((db, table, loc, -1, 0))
-
         return results
 
     # Definição do Schema para o DataFrame de arquivos brutos
@@ -281,12 +341,16 @@ def list_files_distributed(spark, df_catalog, SMALL_FILE_THRESHOLD_BYTES):
     return locations_rdd.mapPartitions(process_partition).toDF(file_schema)
 
 
-def aggregate_and_save(df_raw_files, df_catalog_meta):
+def aggregate_and_save(df_raw_files, df_catalog_meta) -> None:
     """
     Consolida as métricas por tabela e armazena-as no formato Iceberg.
     Assegura que a base de dados e a tabela de destino são criadas, caso não existam.
+
+    Args:
+        df_raw_files (DataFrame): DataFrame com dados brutos da listagem de arquivos.
+        df_catalog_meta (DataFrame): DataFrame com metadados lógicos do catálogo.
     """
-    logger.info("Agregar métricas e calcular percentagens de integridade...")
+    logger.info("Agregando métricas e calcular percentagens de integridade...")
 
     # 5 partições são suficientes para consolidar os metadados e gerar poucos arquivos físicos.
     spark.conf.set("spark.sql.shuffle.partitions", "5")
@@ -342,8 +406,8 @@ def aggregate_and_save(df_raw_files, df_catalog_meta):
 
         logger.info(f"Guardar os resultados na tabela {TARGET_TABLE}...")
 
-        # Using saveAsTable instead of save to register the table in the Metastore
-        # Iceberg format will handle the schema and metadata automatically
+        # Utilizar «saveAsTable» em vez de «save» para registar a tabela no Metastore
+        # O formato Iceberg irá gerir o esquema e os metadados automaticamente
         df_final.write.format("iceberg").partitionBy(
             F.date_trunc("day", F.col("audit_timestamp"))
         ).mode("append").saveAsTable(TARGET_TABLE)
@@ -355,12 +419,53 @@ def aggregate_and_save(df_raw_files, df_catalog_meta):
         raise
 
 
+def run_iceberg_maintenance(spark: SparkSession, table_name: str) -> None:
+    """
+    Realiza a manutenção automática da tabela Iceberg:
+    1. Rewrite Data Files: Compacta arquivos pequenos.
+    2. Rewrite Manifests: Otimiza o índice de metadados.
+    3. Expire Snapshots: Remove histórico físico antigo (30 dias).
+
+    Args:
+        spark (SparkSession): Instância ativa da sessão Spark.
+        table_name (str): Nome da tabela para manutenção.
+    """
+    logger.info(f"Iniciando manutenção automática da tabela {table_name}...")
+
+    try:
+        # Compactação de arquivos pequenos (Small Files)
+        logger.info("- Compactando arquivos de dados (rewrite_data_files)...")
+        spark.sql(f"ALTER TABLE {table_name} EXECUTE rewrite_data_files")
+
+        # Otimização de metadados
+        logger.info("- Otimizando manifestos de metadados (rewrite_manifests)...")
+        spark.sql(f"ALTER TABLE {table_name} EXECUTE rewrite_manifests")
+
+        # Limpeza de histórico físico para economizar storage
+        logger.info("- Expirando snapshots antigos (> 30 dias)...")
+        spark.sql(
+            f"ALTER TABLE {table_name} EXECUTE expire_snapshots(older_than = 'now() - 30d')"
+        )
+
+        logger.info("Manutenção finalizada com sucesso.")
+
+    except Exception as e:
+        logger.warning(
+            f"Aviso: Falha na manutenção automática (pode ser a 1ª execução): {str(e)}"
+        )
+
+
 if __name__ == "__main__":
     start_time = datetime.now()
     logger.info("=== INICIANDO LAKEHOUSE HEALTH AUDIT ===")
 
     try:
+        # Criamos a SparkSession com suporte ao Hive para acessar o catálogo e realizar operações SQL
         spark = get_spark_session()
+
+        # Obter caminho do esquema usando a nova função
+        schema_path = get_schema_path(logger, "lakehouse_health_history")
+        logger.info(f"Caminho do arquivo de esquema definido: {schema_path}")
 
         # Define o tamanho dinamicamente
         SMALL_FILE_SIZE_MB = get_small_file_threshold()
@@ -375,6 +480,10 @@ if __name__ == "__main__":
         # Passo 3: Agregação e Escrita
         aggregate_and_save(df_files, df_meta)
 
+        # Passo 4: Manutenção Automática da Tabela Iceberg
+        run_iceberg_maintenance(spark, TARGET_TABLE)
+
+        # Log do tempo total de execução para monitoramento de performance
         duration = datetime.now() - start_time
         logger.info(f"=== JOB CONCLUÍDO EM {duration} ===")
 
