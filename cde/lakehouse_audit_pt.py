@@ -392,6 +392,7 @@ def aggregate_and_save(df_raw_files, df_catalog_meta) -> None:
         "create_time",
         "last_access",
         "audit_timestamp",
+        "audit_date",
     ]
 
     # Join com os metadados do catálogo coletados no início
@@ -402,6 +403,8 @@ def aggregate_and_save(df_raw_files, df_catalog_meta) -> None:
             "small_files_pct",
             F.round((F.col("small_files_count") / F.col("total_files_count")) * 100, 2),
         )
+        # COLUNA DE DATA PARA PARTIÇÃO
+        .withColumn("audit_date", F.to_date(F.col("audit_timestamp")))
         .select(*final_column_order)
     )
 
@@ -417,9 +420,9 @@ def aggregate_and_save(df_raw_files, df_catalog_meta) -> None:
 
         # Utilizar «saveAsTable» em vez de «save» para registar a tabela no Metastore
         # O formato Iceberg irá gerir o esquema e os metadados automaticamente
-        df_final.write.format("iceberg").partitionBy(
-            F.date_trunc("day", F.col("audit_timestamp"))
-        ).mode("append").saveAsTable(TARGET_TABLE)
+        df_final.write.format("iceberg").partitionBy("audit_date").mode(
+            "append"
+        ).saveAsTable(TARGET_TABLE)
 
         logger.info("O processo de auditoria foi concluído com sucesso.")
 
