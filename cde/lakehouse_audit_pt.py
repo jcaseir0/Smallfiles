@@ -60,7 +60,7 @@ def get_schema_path(
 
 def get_spark_session() -> SparkSession:
     """
-    Cria ou obtém a SparkSession configurada com suporte ao Hive.
+    Cria ou obtém a SparkSession configurada com suporte ao Hive e Iceberg.
 
     Returns:
         SparkSession: Instância ativa da sessão Spark.
@@ -131,12 +131,14 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
         ]
     )
 
+    # Listamos os bancos de dados e tabelas usando a API do catálogo para evitar problemas de inferência do DESCRIBE EXTENDED
     databases = spark.catalog.listDatabases()
     all_tables_metadata = []
 
     # Lista de bancos de dados de sistema para ignorar (não possuem arquivos físicos úteis)
     system_dbs = ["information_schema", "sys", "db_performance"]
 
+    # Iteramos sobre os bancos de dados e tabelas, coletando os metadados detalhados usando DESCRIBE EXTENDED
     for db in databases:
         if db.name.lower() in system_dbs:
             logger.info(f"Ignorar a base de dados do sistema: {db.name}")
@@ -157,7 +159,15 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
                 }
 
                 # Função auxiliar para buscar chaves ignorando maiúsculas/minúsculas
-                def get_meta(key, default=None):
+                def get_meta(key: str, default=None) -> str:
+                    """Busca o valor de uma chave no dicionário de metadados, ignorando maiúsculas/minúsculas.
+
+                    Args:
+                        key (str): A chave a ser buscada.
+                        default: Valor padrão a ser retornado se a chave não for encontrada.
+                    Returns:
+                        str: O valor associado à chave, ou o valor padrão se não encontrado.
+                    """
                     return next(
                         (v for k, v in raw_meta.items() if key.lower() in k.lower()),
                         default,
@@ -174,8 +184,7 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
                 uuid = get_meta("Table UUID") or get_meta("uuid")
 
                 # Lógica de Particionamento / Bucketing
-                part_type = "NONE"
-                part_cols = None
+                part_type, part_cols = "NONE", None
 
                 # Verificamos se há informações de Partição no Describe
                 if (
@@ -223,7 +232,7 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
 
 
 def list_files_distributed(
-    spark: SparkSession, df_catalog, SMALL_FILE_THRESHOLD_BYTES: int
+    spark: SparkSession, df_catalog, threshold_bytes: int
 ) -> StructType:
     """
     Realiza a varredura distribuída de arquivos usando mapPartitions e a API Hadoop FileSystem.
@@ -231,10 +240,10 @@ def list_files_distributed(
     Args:
         spark (SparkSession): Instância ativa da sessão Spark.
         df_catalog (DataFrame): DataFrame contendo as localizações das tabelas para varredura.
-        SMALL_FILE_THRESHOLD_BYTES (int): Tamanho limite em bytes para classificação de arquivo pequeno.
+        threshold_bytes (int): Tamanho limite em bytes para classificação de arquivo pequeno.
 
     Returns:
-        DataFrame: DataFrame contendo o tamanho e a classificação de cada arquivo identificado.
+        DataFrame: Estatísticas físicas por tabela.
     """
     logger.info("Iniciando listagem física de arquivos no storage (Parallel Scan)...")
 
@@ -246,7 +255,7 @@ def list_files_distributed(
     conf_broadcast = spark.sparkContext.broadcast(conf_dict)
 
     # Broadcast do threshold para os workers
-    threshold_broadcast = spark.sparkContext.broadcast(SMALL_FILE_THRESHOLD_BYTES)
+    threshold_broadcast = spark.sparkContext.broadcast(threshold_bytes)
 
     # Convertendo o DataFrame de catálogo para RDD para usar mapPartitions
     locations_rdd = df_catalog.select("db_name", "table_name", "location").rdd
