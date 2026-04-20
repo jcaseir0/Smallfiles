@@ -19,6 +19,7 @@
     { "name": "metadata_location", "type": "string", "comment": "Caminho do arquivo de metadados (específico para tabelas Iceberg)." },
     { "name": "create_time", "type": "string", "comment": "Data e hora de criação da tabela." },
     { "name": "last_access", "type": "string", "comment": "Data e hora do último acesso registrado." },
-    { "name": "audit_timestamp", "type": "timestamp", "comment": "Carimbo de data/hora de quando esta auditoria foi executada." }
+    { "name": "audit_timestamp", "type": "timestamp", "comment": "Carimbo de data/hora de quando esta auditoria foi executada." },
+    { "name": "audit_date", "type": "date", "comment": "Data da auditoria para particionamento eficiente." }
   ]
 }
