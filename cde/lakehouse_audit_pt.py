@@ -15,11 +15,16 @@
 #
 # AUTHOR: João Caseiro
 # EMAIL: jcaseiro@cloudera.com
-# CREATED: 2024-06-01
-# LAST MODIFIED: 2024-06-01
+# CREATED: 2026-04-08
+# LAST MODIFIED: 2026-04-21
 # ---------------------------------------------------------------------------------
-# VERSION: 2.5
+# VERSION: 2.6
 # DESCRIPTION: Lakehouse Health & Metadata Audit for Cloudera Data Engineering.
+# Release Notes:
+# - v2.6: Refatoração completa para otimização de performance e robustez, incluindo:
+#   - Paralelização da Coleta de Metadados;
+#   - Otimização do Scan Físico (Hadoop FileSystem);
+#   - Redução do Overhead de JVM Gateway
 # ---------------------------------------------------------------------------------
 
 import logging, sys, os
@@ -35,6 +40,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- VARIÁVEIS GLOBAIS PADRÃO ---
+logger.info(
+    "#############################################################################################\n"
+    "##### Variáveis globais padrão definidas (podem ser sobrescritas por argumentos do Job) #####\n"
+    "##### DEFAULT_SMALL_FILE_SIZE_MB = 5                                                    #####\n"
+    "##### TARGET_TABLE = 'sys_monitoring.lakehouse_health_history'                          #####\n"
+    "#############################################################################################"
+)
 DEFAULT_SMALL_FILE_SIZE_MB = 5
 TARGET_TABLE = "sys_monitoring.lakehouse_health_history"
 
@@ -103,7 +115,7 @@ def get_small_file_threshold() -> int:
 
 def get_catalog_metadata(spark: SparkSession) -> StructType:
     """
-    Coleta metadados detalhados do catálogo usando um esquema explícito para evitar erros de inferência.
+    Coleta metadados detalhados do catálogo, de forma paralela, usando um esquema explícito.
 
     Args:
         spark (SparkSession): Instância ativa da sessão Spark.
@@ -113,7 +125,7 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
     """
     logger.info("Iniciando coleta de metadados do catálogo (HMS)...")
 
-    # DEFINIÇÃO EXPLÍCITA DO SCHEMA
+    # 1. Definição do Schema
     catalog_schema = StructType(
         [
             StructField("uuid", StringType(), True),
@@ -131,87 +143,93 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
         ]
     )
 
-    # Listamos os bancos de dados e tabelas usando a API do catálogo para evitar problemas de inferência do DESCRIBE EXTENDED
-    databases = spark.catalog.listDatabases()
-    all_tables_metadata = []
+    # 2. Coleta inicial rápida: lista de todas as tabelas no catálogo
+    databases = [
+        db.name
+        for db in spark.catalog.listDatabases()
+        if db.name.lower() not in ["information_schema", "sys", "db_performance"]
+    ]
 
-    # Lista de bancos de dados de sistema para ignorar (não possuem arquivos físicos úteis)
-    system_dbs = ["information_schema", "sys", "db_performance"]
-
-    # Iteramos sobre os bancos de dados e tabelas, coletando os metadados detalhados usando DESCRIBE EXTENDED
+    all_tables_list = []
     for db in databases:
-        if db.name.lower() in system_dbs:
-            logger.info(f"Ignorar a base de dados do sistema: {db.name}")
-            continue
+        for t in spark.catalog.listTables(db):
+            if t.tableType != "VIEW":
+                all_tables_list.append((db, t.name, t.tableType))
 
-        tables = spark.catalog.listTables(db.name)
-        for t in tables:
-            if t.tableType == "VIEW":
-                continue
+    # 3. Transformamos a lista em um RDD para paralelizar a busca detalhada de metadados
+    tables_rdd = spark.sparkContext.parallelize(all_tables_list).repartition(100)
 
+    def process_table_metadata(partition: iter) -> list:
+        """
+        Executado nos Workers: Processa cada tabela da partição em paralelo.
+
+        Args:
+            partition (iterator): Iterador de tuplas (db_name, table_name, table_type) para cada tabela a ser processada.
+
+        Returns:
+            list: Lista de tuplas contendo os metadados extraídos para cada tabela.
+        """
+        from pyspark.sql import SparkSession
+
+        worker_spark = SparkSession.builder.getOrCreate()
+        results = []
+
+        for row in partition:
+            db_name, table_name, t_type_catalog = row
             try:
-                # DESCRIBE EXTENDED para extração do 'Detailed Table Information'
-                desc_df = spark.sql(f"DESCRIBE EXTENDED {db.name}.{t.name}")
+                # Executa o comando SQL pesado no Worker
+                desc_df = worker_spark.sql(f"DESCRIBE EXTENDED {db_name}.{table_name}")
+                raw_meta = {r["col_name"]: r["data_type"] for r in desc_df.collect()}
 
-                # Transformamos em dicionário para busca rápida (chave -> valor)
-                raw_meta = {
-                    row["col_name"]: row["data_type"] for row in desc_df.collect()
-                }
-
-                # Função auxiliar para buscar chaves ignorando maiúsculas/minúsculas
                 def get_meta(key: str, default=None) -> str:
-                    """Busca o valor de uma chave no dicionário de metadados, ignorando maiúsculas/minúsculas.
+                    """
+                    Extrai um valor específico dos metadados brutos.
 
                     Args:
-                        key (str): A chave a ser buscada.
-                        default: Valor padrão a ser retornado se a chave não for encontrada.
+                        key (str): Chave a ser buscada.
+                        default (str, optional): Valor padrão caso a chave não seja encontrada.
+
                     Returns:
-                        str: O valor associado à chave, ou o valor padrão se não encontrado.
+                        str: O valor associado à chave ou o valor padrão.
                     """
                     return next(
                         (v for k, v in raw_meta.items() if key.lower() in k.lower()),
                         default,
                     )
 
-                # Extração de Campos Básicos
+                # Extração
                 loc = get_meta("Location")
                 owner = get_meta("Owner")
                 create_time = get_meta("Created Time") or get_meta("CreateTime")
                 last_access = get_meta("LastAccessTime")
                 meta_loc = get_meta("metadata_location")
                 num_rows = get_meta("numRows")
-                t_type = get_meta("Table Type")
+                t_type = get_meta("Table Type") or t_type_catalog
                 uuid = get_meta("Table UUID") or get_meta("uuid")
 
-                # Lógica de Particionamento / Bucketing
                 part_type, part_cols = "NONE", None
-
-                # Verificamos se há informações de Partição no Describe
                 if (
                     get_meta("Partition Information")
                     or "# Partition Information" in raw_meta
                 ):
                     part_type = "PARTITIONED"
-                    # O Spark lista as partições abaixo da linha '# Partition Information' para coleta das colunas do catálogo
                     p_cols = [
-                        p.name
-                        for p in spark.catalog.listColumns(t.name, db.name)
-                        if p.isPartition
+                        k
+                        for k, v in raw_meta.items()
+                        if k and not k.startswith("#") and "Partition" in k
                     ]
-                    part_cols = ", ".join(p_cols) if p_cols else None
+                    part_cols = ", ".join(p_cols) if p_cols else "Verificar no Catálogo"
 
-                elif get_meta("Num Buckets") or "Num Buckets" in raw_meta:
+                elif get_meta("Num Buckets"):
                     part_type = "BUCKETED"
-                    buckets = get_meta("Num Buckets")
-                    b_cols = get_meta("Bucket Columns")
-                    part_cols = f"{buckets} buckets over ({b_cols})"
+                    part_cols = f"{get_meta('Num Buckets')} buckets"
 
-                all_tables_metadata.append(
+                results.append(
                     (
                         uuid,
                         owner,
-                        db.name,
-                        t.name,
+                        db_name,
+                        table_name,
                         t_type,
                         part_type,
                         part_cols,
@@ -222,20 +240,23 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
                         last_access,
                     )
                 )
-                logger.info(f"Metadados extraídos: {db.name}.{t.name}")
+            except Exception:
+                continue  # Pula tabelas com erro para não travar o Job
 
-            except Exception as e:
-                logger.error(f"Erro ao mapear {db.name}.{t.name}: {str(e)}")
+        return results
 
-    # Criando o DataFrame com o schema fornecido explicitamente
-    return spark.createDataFrame(all_tables_metadata, schema=catalog_schema)
+    # 4. Execução paralela e conversão de volta para DataFrame
+    final_rdd = tables_rdd.mapPartitions(process_table_metadata)
+
+    return spark.createDataFrame(final_rdd, schema=catalog_schema)
 
 
 def list_files_distributed(
     spark: SparkSession, df_catalog, threshold_bytes: int
 ) -> StructType:
     """
-    Realiza a varredura distribuída de arquivos usando mapPartitions e a API Hadoop FileSystem.
+    Realiza a varredura distribuída de arquivos de forma paralela.
+    Aplica repartition para garantir que todos os núcleos do cluster trabalhem simultaneamente.
 
     Args:
         spark (SparkSession): Instância ativa da sessão Spark.
@@ -243,7 +264,7 @@ def list_files_distributed(
         threshold_bytes (int): Tamanho limite em bytes para classificação de arquivo pequeno.
 
     Returns:
-        DataFrame: Estatísticas físicas por tabela.
+        DataFrame: Estatísticas físicas por tabela com scan em paralelo.
     """
     logger.info("Iniciando listagem física de arquivos no storage (Parallel Scan)...")
 
@@ -257,8 +278,10 @@ def list_files_distributed(
     # Broadcast do threshold para os workers
     threshold_broadcast = spark.sparkContext.broadcast(threshold_bytes)
 
-    # Convertendo o DataFrame de catálogo para RDD para usar mapPartitions
-    locations_rdd = df_catalog.select("db_name", "table_name", "location").rdd
+    # 2. Paralelização: O segredo da performance está no repartition.
+    locations_rdd = df_catalog.select(
+        "db_name", "table_name", "location"
+    ).rdd.repartition(100)
 
     def process_partition(rows: iter) -> list:
         """
@@ -272,29 +295,11 @@ def list_files_distributed(
         """
         logger.info("Processando partição de arquivos no Worker...")
 
-        # Usamos o gateway da JVM que já está disponível no worker
-        try:
-            from py4j.java_gateway import java_import
-
-            # O Spark expõe a JVM nos workers através desse objeto interno
-            import sys
-
-            # Acessamos a JVM local do processo Worker
-            # No Spark, o gateway padrão nos workers é acessível via:
-            from pyspark.java_gateway import launch_gateway
-
-            # No entanto, em Workers CDE, o método mais seguro é instanciar a Config diretamente
-            # via py4j bridge se disponível, ou usar o objeto de sistema.
-        except ImportError:
-            pass
-
-        # Abordagem robusta para CDE: Reconstrução manual via gateway interno
         import pyspark
+        from pyspark.java_gateway import launch_gateway
 
-        # O Spark já inicializa um gateway Py4J para cada worker, então podemos reutilizá-lo
+        # O Spark já inicializa um gateway Py4J local no worker
         gateway = pyspark.java_gateway.launch_gateway()
-
-        # Acessamos a JVM do Spark diretamente, que já está disponível no worker
         jvm = gateway.jvm
 
         # Reconstruímos a configuração Hadoop
@@ -316,8 +321,6 @@ def list_files_distributed(
             if not loc or loc == "None":
                 continue
 
-            # Log para cada tabela processada (pode ser verboso, mas útil para debugging)
-            logger.info(f"Listando arquivos para {db}.{table} em {loc}...")
             try:
                 h_path = Path(loc)
                 fs = FileSystem.get(h_path.toUri(), hadoop_conf)
