@@ -37,8 +37,14 @@ Após a criação, aparecerá uma linha com o novo repositório criado e o **Sta
 7.  **Spark Configurations:**
     * `spark.sql.iceberg.handle-timestamp-without-timezone`: `true`
     * `spark.sql.shuffle.partitions`: `5` (Evita geração de arquivos pequenos na tabela de saída).
-8. Na sessão **Advanced Configuration**, defina `4` Executors
-9. Na sessão **Schedule**, utilizaremos a seguinte configuração:
+8. Na sessão **Advanced Configuration**:
+   1. Executors: 10-15
+   2. Initial Executors: 2
+   3. Driver Cores: 2
+   4. Executor Cores: 4
+   5. Driver Memory: 2
+   6. Executor Memory: 4
+9.  Na sessão **Schedule**, utilizaremos a seguinte configuração:
     * **Basic**
     * Every `year`on `every day`of `every month` at `22`:`0`
     * Start Date: `selecione o dia que irá iniciar a coleta`

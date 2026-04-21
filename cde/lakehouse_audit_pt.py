@@ -18,13 +18,20 @@
 # CREATED: 2026-04-08
 # LAST MODIFIED: 2026-04-21
 # ---------------------------------------------------------------------------------
-# VERSION: 2.6
+# VERSION: 2.7
 # DESCRIPTION: Lakehouse Health & Metadata Audit for Cloudera Data Engineering.
 # Release Notes:
-# - v2.6: Refatoração completa para otimização de performance e robustez, incluindo:
-#   - Paralelização da Coleta de Metadados;
-#   - Otimização do Scan Físico (Hadoop FileSystem);
-#   - Redução do Overhead de JVM Gateway
+# - v2.7: Correção na lógica de extração atual que estão causando os valores NULL e as falhas nas métricas:
+#  - Incompatibilidade de Schema (O Desvio de Colunas)
+#  - Falha na captura de numRows
+#  - Métricas Físicas com -1
+# - v2.6: Refatoração completa para otimização de performance e escalabilidade.
+# - v2.5: Correção de bugs e melhorias na coleta de metadados e adição de manutenção automática da tabela Iceberg.
+# - v2.4: Implementação de logging detalhado e tratamento de erros robustoo.
+# - v2.3: Otimização da varredura de arquivos usando mapPartitions e broadcast de configurações.
+# - v2.2: Adição de argumentos dinâmicos para configuração de tamanho de arquivos pequenos.
+# - v2.1: Melhoria na definição de schema para evitar erros de inferência.
+# - v2.0: Refatoração completa do código para melhor organização e legibilidade.
 # ---------------------------------------------------------------------------------
 
 import logging, sys, os
@@ -179,75 +186,83 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
             try:
                 # Executa o comando SQL pesado no Worker
                 desc_df = worker_spark.sql(f"DESCRIBE EXTENDED {db_name}.{table_name}")
-                raw_meta = {r["col_name"]: r["data_type"] for r in desc_df.collect()}
+                raw_data = desc_df.collect()
 
-                def get_meta(key: str, default=None) -> str:
+                # Dicionário de busca normalizado (case-insensitive e trim)
+                meta = {}
+                for r in raw_data:
+                    key = str(r["col_name"]).strip()
+                    val = str(r["data_type"]).strip()
+                    if key and val:
+                        meta[key.lower()] = val
+
+                # Função interna de busca robusta
+                def find_val(search_key: str) -> str:
                     """
-                    Extrai um valor específico dos metadados brutos.
+                    Busca o valor para uma chave de metadado, tentando correspondência exata e por substring.
 
                     Args:
-                        key (str): Chave a ser buscada.
-                        default (str, optional): Valor padrão caso a chave não seja encontrada.
+                        search_key (str): A chave de metadado a ser buscada.
 
                     Returns:
-                        str: O valor associado à chave ou o valor padrão.
+                        str: O valor encontrado ou None se não encontrado.
                     """
-                    return next(
-                        (v for k, v in raw_meta.items() if key.lower() in k.lower()),
-                        default,
-                    )
+                    for k, v in meta.items():
+                        if search_key.lower() in k.lower():
+                            return v
+                    return None
 
-                # Extração
-                loc = get_meta("Location")
-                owner = get_meta("Owner")
-                create_time = get_meta("Created Time") or get_meta("CreateTime")
-                last_access = get_meta("LastAccessTime")
-                meta_loc = get_meta("metadata_location")
-                num_rows = get_meta("numRows")
-                t_type = get_meta("Table Type") or t_type_catalog
-                uuid = get_meta("Table UUID") or get_meta("uuid")
+                # 1. Extração de Identificação
+                uuid = find_val("uuid") or find_val("tableid") or "N/A"
+                owner = find_val("Owner:") or find_val("Owner") or "UNKNOWN"
 
-                part_type, part_cols = "NONE", None
-                if (
-                    get_meta("Partition Information")
-                    or "# Partition Information" in raw_meta
-                ):
+                # 2. Extração de Métricas (Buscando especificamente nos Table Parameters)
+                num_rows = meta.get("numrows") or meta.get("num_rows") or "0"
+
+                # 3. Informações de Tabela
+                t_type = find_val("Table Type:") or t_type_catalog
+                loc = find_val("Location:") or find_val("Location")
+
+                # 4. Data e Localização de Metadados (Iceberg)
+                create_time = find_val("CreateTime:") or find_val("Created Time")
+                last_access = find_val("LastAccessTime:")
+                meta_loc = meta.get("metadata_location")
+
+                # 5. Lógica de Partição
+                part_type = "NONE"
+                part_cols = None
+                if find_val(
+                    "Partition Information"
+                ) or "# Partition Information" in str(meta.keys()):
                     part_type = "PARTITIONED"
-                    p_cols = [
-                        k
-                        for k, v in raw_meta.items()
-                        if k and not k.startswith("#") and "Partition" in k
-                    ]
-                    part_cols = ", ".join(p_cols) if p_cols else "Verificar no Catálogo"
+                    # Buscamos colunas de partição de forma simples no describe
+                    p_cols = [k for k, v in meta.items() if "partition column" in k]
+                    part_cols = ", ".join(p_cols) if p_cols else "SIM"
 
-                elif get_meta("Num Buckets"):
-                    part_type = "BUCKETED"
-                    part_cols = f"{get_meta('Num Buckets')} buckets"
-
+                # IMPORTANTE: A ordem desta tupla DEVE ser idêntica ao catalog_schema
                 results.append(
                     (
-                        uuid,
-                        owner,
-                        db_name,
-                        table_name,
-                        t_type,
-                        part_type,
-                        part_cols,
-                        str(num_rows) if num_rows else None,
-                        loc,
-                        meta_loc,
-                        create_time,
-                        last_access,
+                        str(uuid),
+                        str(owner),
+                        str(db_name),
+                        str(table_name),
+                        str(t_type),
+                        str(part_type),
+                        str(part_cols),
+                        str(num_rows),
+                        str(loc),
+                        str(meta_loc),
+                        str(create_time),
+                        str(last_access),
                     )
                 )
-            except Exception:
-                continue  # Pula tabelas com erro para não travar o Job
+            except Exception as e:
+                continue
 
         return results
 
     # 4. Execução paralela e conversão de volta para DataFrame
     final_rdd = tables_rdd.mapPartitions(process_table_metadata)
-
     return spark.createDataFrame(final_rdd, schema=catalog_schema)
 
 
