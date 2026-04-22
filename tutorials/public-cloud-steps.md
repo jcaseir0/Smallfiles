@@ -57,6 +57,7 @@ Após a criação, aparecerá uma linha com o novo repositório criado e o **Sta
 Com os dados persistidos na tabela `sys_monitoring.lakehouse_health_history`, você pode realizar análises diretamente no Impala para alimentar o **Cloudera Data Visualization**.
 
 ### A. Quantidade de Tabelas por Database
+
 ```sql
 SELECT db_name, COUNT(DISTINCT table_name) as qtd_tabelas
 FROM sys_monitoring.lakehouse_health_history
@@ -66,6 +67,7 @@ ORDER BY qtd_tabelas DESC;
 ```
 
 ### B. Top 10 Tabelas com Maior Quantidade de Arquivos Pequenos
+
 ```sql
 SELECT db_name, table_name, small_files_count, total_files_count, small_files_pct
 FROM sys_monitoring.lakehouse_health_history
@@ -75,6 +77,7 @@ LIMIT 10;
 ```
 
 ### C. Proporção de Tabelas Particionadas vs. Não Particionadas
+
 ```sql
 SELECT partitioning_type, COUNT(*) as total_tabelas
 FROM sys_monitoring.lakehouse_health_history
@@ -82,6 +85,14 @@ WHERE audit_timestamp = (SELECT MAX(audit_timestamp) FROM sys_monitoring.lakehou
 GROUP BY partitioning_type;
 ```
 
+### D. Consulta de Integridade de uma tabela específica pelo UUID
+
+```sql
+SELECT * FROM sys_monitoring.lakehouse_health_history 
+WHERE uuid = '7e9b5f3a1c2d4e5f6a7b8c9d0e1f2a3b' -- Exemplo de Hash MD5
+ORDER BY audit_timestamp DESC 
+LIMIT 1;
+```
 ---
 
 ## 5. Fluxo de Funcionamento e Manutenção

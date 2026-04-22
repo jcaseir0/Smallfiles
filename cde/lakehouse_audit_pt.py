@@ -26,6 +26,7 @@
 #  .1: Nova Função de Geração de UUID para garantir a unicidade e rastreabilidade de cada tabela auditada.
 #  .0: Falha na captura de numRows
 #  .0: Métricas Físicas com -1
+#  .2: Correção do erro CONTEXT_ONLY_VALID_ON_DRIVER causado pelo uso de SparkSession dentro de funções executadas em Workers (mapPartitions).
 # - v2.6: Refatoração completa para otimização de performance e escalabilidade - estável.
 # - v2.5: Correção de bugs e melhorias na coleta de metadados e adição de manutenção automática da tabela Iceberg.
 # - v2.4: Implementação de logging detalhado e tratamento de erros robustoo.
@@ -40,6 +41,7 @@ from datetime import datetime
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import StructType, StructField, StringType, LongType, DoubleType
+from concurrent.futures import ThreadPoolExecutor
 
 # 1. Configuração de Logging (Melhor prática para Verbose no CDE)
 logging.basicConfig(
@@ -142,7 +144,7 @@ def generate_table_uuid(db_name: str, table_name: str) -> str:
 
 def get_catalog_metadata(spark: SparkSession) -> StructType:
     """
-    Coleta metadados detalhados do catálogo, de forma paralela, usando um esquema explícito.
+    Coleta metadados detalhados do catálogo, de forma paralela, usando Multithreading no Driver.
 
     Args:
         spark (SparkSession): Instância ativa da sessão Spark.
@@ -183,121 +185,98 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
             if t.tableType != "VIEW":
                 all_tables_list.append((db, t.name, t.tableType))
 
-    # 3. Transformamos a lista em um RDD para paralelizar a busca detalhada de metadados
-    tables_rdd = spark.sparkContext.parallelize(all_tables_list).repartition(100)
-
-    def process_table_metadata(partition: iter) -> list:
+    def fetch_table_details(row: tuple) -> tuple:
         """
-        Executado nos Workers: Processa cada tabela da partição em paralelo.
+        Função executada por threads no Driver para consultar o Metastore.
 
         Args:
-            partition (iterator): Iterador de tuplas (db_name, table_name, table_type) para cada tabela a ser processada.
+            row (tuple): Tupla contendo (db_name, table_name, t_type_catalog)
 
         Returns:
-            list: Lista de tuplas contendo os metadados extraídos para cada tabela.
+            tuple: Tupla com os metadados extraídos para a tabela ou None em caso de falha.
         """
-        from pyspark.sql import SparkSession
+        db_name, table_name, t_type_catalog = row
+        try:
+            # Consulta individual (Thread-safe no Spark Driver)
+            desc_df = spark.sql(f"DESCRIBE EXTENDED {db_name}.{table_name}")
+            raw_meta = {
+                str(r["col_name"]).strip().lower(): str(r["data_type"]).strip()
+                for r in desc_df.collect()
+                if r["col_name"]
+            }
 
-        worker_spark = SparkSession.builder.getOrCreate()
-        results = []
+            def find_val(search_key: str) -> str:
+                """
+                Função para encontrar um valor específico em raw_meta.
 
-        for row in partition:
-            db_name, table_name, t_type_catalog = row
-            try:
-                # Executa o comando SQL pesado no Worker
-                desc_df = worker_spark.sql(f"DESCRIBE EXTENDED {db_name}.{table_name}")
-                raw_meta = {
-                    str(r["col_name"]).strip().lower(): str(r["data_type"]).strip()
-                    for r in desc_df.collect()
-                    if r["col_name"]
-                }
+                Args:
+                    search_key (str): A chave a ser buscada (ex: "owner", "location", "numrows").
 
-                # Função interna de busca robusta
-                def find_val(search_key: str) -> str:
-                    """
-                    Busca o valor para uma chave de metadado, tentando correspondência exata e por substring.
-
-                    Args:
-                        search_key (str): A chave de metadado a ser buscada.
-
-                    Returns:
-                        str: O valor encontrado ou None se não encontrado.
-                    """
-                    return next(
-                        (v for k, v in raw_meta.items() if search_key.lower() in k),
-                        None,
-                    )
-
-                # 1. Extração de Identificação
-                catalog_uuid = (
-                    find_val("uuid") or find_val("tableid") or find_val("table_id")
+                Returns:
+                    str: O valor correspondente ou None se não encontrado.
+                """
+                return next(
+                    (v for k, v in raw_meta.items() if search_key.lower() in k), None
                 )
+
+            # --- Lógica de UUID determinístico ---
+            catalog_uuid = find_val("uuid") or find_val("tableid")
+            if not catalog_uuid or catalog_uuid in ["None", "NULL", "N/A"]:
+                uuid = generate_table_uuid(db_name, table_name)
+            else:
+                uuid = catalog_uuid
+
+            # --- Extração de Metadados ---
+            owner = find_val("owner:") or find_val("owner") or "UNKNOWN"
+            num_rows = raw_meta.get("numrows") or raw_meta.get("num_rows") or "0"
+            t_type = find_val("table type") or t_type_catalog
+            loc = find_val("location:") or find_val("location") or "UNKNOWN"
+            create_time = find_val("createtime:") or find_val("created time")
+            last_access = find_val("lastaccesstime:") or "UNKNOWN"
+
+            meta_loc = (
+                raw_meta.get("metadata_location")
+                if "iceberg" in str(t_type).lower()
+                else "N/A"
+            )
+
+            part_type = (
+                "PARTITIONED"
                 if (
-                    not catalog_uuid
-                    or catalog_uuid == "None"
-                    or catalog_uuid == "NULL"
-                    or catalog_uuid == "N/A"
-                ):
-                    uuid = generate_table_uuid(db_name, table_name)
-                else:
-                    uuid = catalog_uuid
-
-                owner = find_val("owner:") or find_val("Owner") or "UNKNOWN"
-
-                # 2. Métricas Lógicas (captura o '36' do seu numRows)
-                num_rows = raw_meta.get("numrows") or raw_meta.get("num_rows") or "0"
-
-                # 3. Tipos e Partição
-                t_type = find_val("table type") or t_type_catalog
-                part_type = (
-                    "PARTITIONED"
-                    if (
-                        "partition information" in str(raw_meta.keys())
-                        or find_val("partition column")
-                    )
-                    else "NONE"
+                    "partition information" in str(raw_meta.keys())
+                    or find_val("partition column")
                 )
-                part_cols = find_val("partition column") or None
+                else "NONE"
+            )
+            part_cols = find_val("partition column") or None
 
-                # 4. Data e Localização de Metadados (Iceberg)
-                loc = find_val("Location:") or find_val("Location") or "UNKNOWN"
-                create_time = find_val("CreateTime:") or find_val("Created Time")
-                last_access = (
-                    find_val("LastAccessTime:")
-                    or find_val("lastaccesstime")
-                    or "UNKNOWN"
-                )
-                meta_loc = (
-                    raw_meta.get("metadata_location")
-                    if t_type == "ICEBERG"
-                    else "NOT_ICEBERG_TABLE"
-                )
+            return (
+                str(uuid),
+                str(owner),
+                str(db_name),
+                str(table_name),
+                str(t_type),
+                str(part_type),
+                str(part_cols),
+                str(num_rows),
+                str(loc),
+                str(meta_loc),
+                str(create_time),
+                str(last_access),
+            )
+        except Exception:
+            return None
 
-                # IMPORTANTE: A ordem desta tupla DEVE ser idêntica ao catalog_schema
-                results.append(
-                    (
-                        str(uuid),
-                        str(owner),
-                        str(db_name),
-                        str(table_name),
-                        str(t_type),
-                        str(part_type),
-                        str(part_cols),
-                        str(num_rows),
-                        str(loc),
-                        str(meta_loc),
-                        str(create_time),
-                        str(last_access),
-                    )
-                )
-            except Exception as e:
-                continue
+    # 3. Execução em paralelo usando ThreadPoolExecutor
+    # Usamos 20 threads para não sobrecarregar o Metastore, mas acelerar o I/O
+    all_tables_metadata = []
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        results = list(executor.map(fetch_table_details, all_tables_list))
 
-        return results
+    # Filtra falhas e converte para DataFrame
+    all_tables_metadata = [r for r in results if r is not None]
 
-    # 4. Execução paralela e conversão de volta para DataFrame
-    final_rdd = tables_rdd.mapPartitions(process_table_metadata)
-    return spark.createDataFrame(final_rdd, schema=catalog_schema)
+    return spark.createDataFrame(all_tables_metadata, schema=catalog_schema)
 
 
 def list_files_distributed(
