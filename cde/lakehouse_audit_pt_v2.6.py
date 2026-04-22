@@ -18,21 +18,13 @@
 # CREATED: 2026-04-08
 # LAST MODIFIED: 2026-04-21
 # ---------------------------------------------------------------------------------
-# VERSION: 2.7
+# VERSION: 2.6
 # DESCRIPTION: Lakehouse Health & Metadata Audit for Cloudera Data Engineering.
 # Release Notes:
-# - v2.7: Correção na lógica de extração atual que estão causando os valores NULL e as falhas nas métricas:
-#  - Incompatibilidade de Schema (O Desvio de Colunas)
-# . - Nova Função de Geração de UUID para garantir a unicidade e rastreabilidade de cada tabela auditada.
-#  - Falha na captura de numRows
-#  - Métricas Físicas com -1
-# - v2.6: Refatoração completa para otimização de performance e escalabilidade - estável.
-# - v2.5: Correção de bugs e melhorias na coleta de metadados e adição de manutenção automática da tabela Iceberg.
-# - v2.4: Implementação de logging detalhado e tratamento de erros robustoo.
-# - v2.3: Otimização da varredura de arquivos usando mapPartitions e broadcast de configurações.
-# - v2.2: Adição de argumentos dinâmicos para configuração de tamanho de arquivos pequenos.
-# - v2.1: Melhoria na definição de schema para evitar erros de inferência.
-# - v2.0: Refatoração completa do código para melhor organização e legibilidade.
+# - v2.6: Refatoração completa para otimização de performance e robustez, incluindo:
+#   - Paralelização da Coleta de Metadados;
+#   - Otimização do Scan Físico (Hadoop FileSystem);
+#   - Redução do Overhead de JVM Gateway
 # ---------------------------------------------------------------------------------
 
 import logging, sys, os
@@ -49,8 +41,7 @@ logger = logging.getLogger(__name__)
 
 # --- VARIÁVEIS GLOBAIS PADRÃO ---
 logger.info(
-    "Informações importantes sobre as variáveis globais padrão definidas para o Job:"
-    "\n#############################################################################################\n"
+    "#############################################################################################\n"
     "##### Variáveis globais padrão definidas (podem ser sobrescritas por argumentos do Job) #####\n"
     "##### DEFAULT_SMALL_FILE_SIZE_MB = 5                                                    #####\n"
     "##### TARGET_TABLE = 'sys_monitoring.lakehouse_health_history'                          #####\n"
@@ -122,24 +113,6 @@ def get_small_file_threshold() -> int:
     return DEFAULT_SMALL_FILE_SIZE_MB
 
 
-def generate_table_uuid(db_name: str, table_name: str) -> str:
-    """
-    Gera um UUID determinístico para a tabela baseado no seu nome completo.
-    Serve como chave primária para garantir a integridade em consultas.
-
-    Args:
-        db_name (str): Nome do banco de dados.
-        table_name (str): Nome da tabela.
-
-    Returns:
-        str: Um hash MD5 único que identifica a tabela.
-    """
-    import hashlib
-
-    full_name = f"{db_name.lower()}.{table_name.lower()}"
-    return hashlib.md5(full_name.encode()).hexdigest()
-
-
 def get_catalog_metadata(spark: SparkSession) -> StructType:
     """
     Coleta metadados detalhados do catálogo, de forma paralela, usando um esquema explícito.
@@ -162,7 +135,7 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
             StructField("table_type", StringType(), True),
             StructField("partitioning_type", StringType(), True),
             StructField("partitioning_cols", StringType(), True),
-            StructField("num_rows", StringType(), True),
+            StructField("num_rows", StringType(), True),  # Movido para cá
             StructField("location", StringType(), True),
             StructField("metadata_location", StringType(), True),
             StructField("create_time", StringType(), True),
@@ -206,97 +179,75 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
             try:
                 # Executa o comando SQL pesado no Worker
                 desc_df = worker_spark.sql(f"DESCRIBE EXTENDED {db_name}.{table_name}")
-                raw_meta = {
-                    str(r["col_name"]).strip().lower(): str(r["data_type"]).strip()
-                    for r in desc_df.collect()
-                    if r["col_name"]
-                }
+                raw_meta = {r["col_name"]: r["data_type"] for r in desc_df.collect()}
 
-                # Função interna de busca robusta
-                def find_val(search_key: str) -> str:
+                def get_meta(key: str, default=None) -> str:
                     """
-                    Busca o valor para uma chave de metadado, tentando correspondência exata e por substring.
+                    Extrai um valor específico dos metadados brutos.
 
                     Args:
-                        search_key (str): A chave de metadado a ser buscada.
+                        key (str): Chave a ser buscada.
+                        default (str, optional): Valor padrão caso a chave não seja encontrada.
 
                     Returns:
-                        str: O valor encontrado ou None se não encontrado.
+                        str: O valor associado à chave ou o valor padrão.
                     """
                     return next(
-                        (v for k, v in raw_meta.items() if search_key.lower() in k),
-                        None,
+                        (v for k, v in raw_meta.items() if key.lower() in k.lower()),
+                        default,
                     )
 
-                # 1. Extração de Identificação
-                catalog_uuid = (
-                    find_val("uuid") or find_val("tableid") or find_val("table_id")
-                )
+                # Extração
+                loc = get_meta("Location")
+                owner = get_meta("Owner")
+                create_time = get_meta("Created Time") or get_meta("CreateTime")
+                last_access = get_meta("LastAccessTime")
+                meta_loc = get_meta("metadata_location")
+                num_rows = get_meta("numRows")
+                t_type = get_meta("Table Type") or t_type_catalog
+                uuid = get_meta("Table UUID") or get_meta("uuid")
+
+                part_type, part_cols = "NONE", None
                 if (
-                    not catalog_uuid
-                    or catalog_uuid == "None"
-                    or catalog_uuid == "NULL"
-                    or catalog_uuid == "N/A"
+                    get_meta("Partition Information")
+                    or "# Partition Information" in raw_meta
                 ):
-                    uuid = generate_table_uuid(db_name, table_name)
-                else:
-                    uuid = catalog_uuid
+                    part_type = "PARTITIONED"
+                    p_cols = [
+                        k
+                        for k, v in raw_meta.items()
+                        if k and not k.startswith("#") and "Partition" in k
+                    ]
+                    part_cols = ", ".join(p_cols) if p_cols else "Verificar no Catálogo"
 
-                owner = find_val("owner:") or find_val("Owner") or "UNKNOWN"
+                elif get_meta("Num Buckets"):
+                    part_type = "BUCKETED"
+                    part_cols = f"{get_meta('Num Buckets')} buckets"
 
-                # 2. Métricas Lógicas (captura o '36' do seu numRows)
-                num_rows = raw_meta.get("numrows") or raw_meta.get("num_rows") or "0"
-
-                # 3. Tipos e Partição
-                t_type = find_val("table type") or t_type_catalog
-                part_type = (
-                    "PARTITIONED"
-                    if (
-                        "partition information" in str(raw_meta.keys())
-                        or find_val("partition column")
-                    )
-                    else "NONE"
-                )
-                part_cols = find_val("partition column") or None
-
-                # 4. Data e Localização de Metadados (Iceberg)
-                loc = find_val("Location:") or find_val("Location") or "UNKNOWN"
-                create_time = find_val("CreateTime:") or find_val("Created Time")
-                last_access = (
-                    find_val("LastAccessTime:")
-                    or find_val("lastaccesstime")
-                    or "UNKNOWN"
-                )
-                meta_loc = (
-                    raw_meta.get("metadata_location")
-                    if t_type == "ICEBERG"
-                    else "NOT_ICEBERG_TABLE"
-                )
-
-                # IMPORTANTE: A ordem desta tupla DEVE ser idêntica ao catalog_schema
                 results.append(
                     (
-                        str(uuid),
-                        str(owner),
-                        str(db_name),
-                        str(table_name),
-                        str(t_type),
-                        str(part_type),
-                        str(part_cols),
-                        str(num_rows),
-                        str(loc),
-                        str(meta_loc),
-                        str(create_time),
-                        str(last_access),
+                        uuid,
+                        owner,
+                        db_name,
+                        table_name,
+                        t_type,
+                        part_type,
+                        part_cols,
+                        str(num_rows) if num_rows else None,
+                        loc,
+                        meta_loc,
+                        create_time,
+                        last_access,
                     )
                 )
-            except Exception as e:
-                continue
+            except Exception:
+                continue  # Pula tabelas com erro para não travar o Job
 
         return results
 
     # 4. Execução paralela e conversão de volta para DataFrame
     final_rdd = tables_rdd.mapPartitions(process_table_metadata)
+
     return spark.createDataFrame(final_rdd, schema=catalog_schema)
 
 
@@ -345,7 +296,6 @@ def list_files_distributed(
         logger.info("Processando partição de arquivos no Worker...")
 
         import pyspark
-        from datetime import datetime
         from pyspark.java_gateway import launch_gateway
 
         # O Spark já inicializa um gateway Py4J local no worker
@@ -380,11 +330,8 @@ def list_files_distributed(
                     while files_iter.hasNext():
                         f = files_iter.next()
                         size = f.getLen()
-                        m_time_ms = f.getModificationTime()
-                        dt_object = datetime.fromtimestamp(m_time_ms / 1000.0)
-                        date_str = dt_object.strftime("%Y-%m-%d %H:%M:%S")
                         is_small = 1 if 0 < size < current_threshold else 0
-                        results.append((db, table, loc, size, date_str, is_small))
+                        results.append((db, table, loc, size, is_small))
                 else:
                     results.append((db, table, loc, -2, 0))
             except Exception:
@@ -399,7 +346,6 @@ def list_files_distributed(
             StructField("location", StringType(), True),
             StructField("file_size", LongType(), True),
             StructField("is_small", LongType(), True),
-            StructField("s3_last_modified", StringType(), True),
         ]
     )
 
@@ -427,7 +373,6 @@ def aggregate_and_save(df_raw_files, df_catalog_meta) -> None:
         F.sum("file_size").alias("total_size_bytes"),
         F.sum("is_small").alias("small_files_count"),
         F.avg("file_size").alias("avg_file_size_bytes"),
-        F.max("s3_last_modified").alias("actual_last_access"),
     )
 
     # Define a ordem final desejada das colunas, colocando métricas físicas após os metadados
@@ -457,9 +402,6 @@ def aggregate_and_save(df_raw_files, df_catalog_meta) -> None:
     df_final = (
         df_catalog_meta.join(df_physical, ["db_name", "table_name"], "left")
         .withColumn("audit_timestamp", F.current_timestamp())
-        .withColumn(
-            "last_access", F.coalesce(F.col("actual_last_access"), F.col("last_access"))
-        )
         .withColumn(
             "small_files_pct",
             F.round((F.col("small_files_count") / F.col("total_files_count")) * 100, 2),
