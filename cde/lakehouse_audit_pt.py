@@ -21,11 +21,11 @@
 # VERSION: 2.7
 # DESCRIPTION: Lakehouse Health & Metadata Audit for Cloudera Data Engineering.
 # Release Notes:
-# - v2.7: Correção na lógica de extração atual que estão causando os valores NULL e as falhas nas métricas:
-#  - Incompatibilidade de Schema (O Desvio de Colunas)
-# . - Nova Função de Geração de UUID para garantir a unicidade e rastreabilidade de cada tabela auditada.
-#  - Falha na captura de numRows
-#  - Métricas Físicas com -1
+# - v2.7.1: Correção na lógica de extração atual que estão causando os valores NULL e as falhas nas métricas:
+#  .0: Incompatibilidade de Schema (O Desvio de Colunas)
+#  .1: Nova Função de Geração de UUID para garantir a unicidade e rastreabilidade de cada tabela auditada.
+#  .0: Falha na captura de numRows
+#  .0: Métricas Físicas com -1
 # - v2.6: Refatoração completa para otimização de performance e escalabilidade - estável.
 # - v2.5: Correção de bugs e melhorias na coleta de metadados e adição de manutenção automática da tabela Iceberg.
 # - v2.4: Implementação de logging detalhado e tratamento de erros robustoo.
