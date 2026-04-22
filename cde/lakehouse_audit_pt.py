@@ -21,7 +21,7 @@
 # VERSION: 2.7
 # DESCRIPTION: Lakehouse Health & Metadata Audit for Cloudera Data Engineering.
 # Release Notes:
-# - v2.7.1: Correção na lógica de extração atual que estão causando os valores NULL e as falhas nas métricas:
+# - v2.7.2: Correção na lógica de extração atual que estão causando os valores NULL e as falhas nas métricas:
 #  .0: Incompatibilidade de Schema (O Desvio de Colunas)
 #  .1: Nova Função de Geração de UUID para garantir a unicidade e rastreabilidade de cada tabela auditada.
 #  .0: Falha na captura de numRows
@@ -325,7 +325,6 @@ def list_files_distributed(
 
         import pyspark
         from datetime import datetime
-        from pyspark.java_gateway import launch_gateway
 
         # O Spark já inicializa um gateway Py4J local no worker
         gateway = pyspark.java_gateway.launch_gateway()
@@ -363,11 +362,13 @@ def list_files_distributed(
                         dt_object = datetime.fromtimestamp(m_time_ms / 1000.0)
                         date_str = dt_object.strftime("%Y-%m-%d %H:%M:%S")
                         is_small = 1 if 0 < size < current_threshold else 0
-                        results.append((db, table, loc, size, date_str, is_small))
+                        results.append((db, table, loc, size, is_small, date_str))
                 else:
-                    results.append((db, table, loc, -2, 0))
+                    # Caminho não existe
+                    results.append((db, table, loc, -2, 0, "1900-01-01 00:00:00"))
             except Exception:
-                results.append((db, table, loc, -1, 0))
+                # Erro de permissão/acesso
+                results.append((db, table, loc, -1, 0, "1900-01-01 00:00:00"))
         return results
 
     # Definição do Schema para o DataFrame de arquivos brutos
