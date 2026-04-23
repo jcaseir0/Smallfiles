@@ -21,7 +21,7 @@
 # VERSION: 2.7
 # DESCRIPTION: Lakehouse Health & Metadata Audit for Cloudera Data Engineering.
 # Release Notes:
-# - v2.7.3: Correção na lógica de extração atual que estão causando os valores NULL e as falhas nas métricas:
+# - v2.7.4: Correção na lógica de extração atual que estão causando os valores NULL e as falhas nas métricas:
 #  .0: Incompatibilidade de Schema (O Desvio de Colunas)
 #  .1: Nova Função de Geração de UUID para garantir a unicidade e rastreabilidade de cada tabela auditada.
 #  .0: Falha na captura de numRows
@@ -30,6 +30,8 @@
 #  .3: Adição do argumento 2 para alteração do nome padrão da tabela de destino, permitindo flexibilidade total sem necessidade de editar o código.
 #  .3: Correção da coleta de metadados da coluna table_type.
 #  .3: Adição de nova coluna chamada write_format para identificar o formato de escrita da tabela (ex: Parquet, ORC, AVRO, CSV).
+#  .4: Correção para o valor da coluna table_type.
+#  .4: Correção para colunas de partição e bucketing e definição da coluna responsável pelo tipo de particionamento.
 # - v2.6: Refatoração completa para otimização de performance e escalabilidade - estável.
 # - v2.5: Correção de bugs e melhorias na coleta de metadados e adição de manutenção automática da tabela Iceberg.
 # - v2.4: Implementação de logging detalhado e tratamento de erros robustoo.
@@ -239,7 +241,10 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
         """
         db_name, table_name, t_type_catalog = row
         try:
-            # Consulta individual (Thread-safe no Spark Driver)
+            # 1. Coleta metadados estruturados via Catalog para identificar colunas de partição
+            tbl_obj = spark.catalog.getTable(db_name, table_name)
+
+            # 2. Consulta individual (Thread-safe no Spark Driver)
             desc_df = spark.sql(f"DESCRIBE EXTENDED {db_name}.{table_name}")
             raw_meta = {
                 str(r["col_name"])
@@ -272,43 +277,60 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
             else:
                 uuid = catalog_uuid
 
-            # --- LÓGICA HIERÁRQUICA DE TABLE_TYPE ---
-            # 1. Valor base do Describe
-            base_type = find_val("table type") or t_type_catalog
-            final_type = base_type
+            # --- NOVA LÓGICA DE PARTICIONAMENTO E BUCKETING ---
+            # O Catalog identifica colunas de partição de forma nativa
+            columns = spark.catalog.listColumns(db_name, table_name)
+            partition_cols_list = [col.name for col in columns if col.isPartition]
+            bucket_cols_list = [col.name for col in columns if col.isBucket]
 
-            # 2. Verificação de sub-chaves nos Table Parameters
-            is_iceberg = raw_meta.get("table_type") == "ICEBERG"
-            is_trino = "trino_version" in raw_meta
+            if partition_cols_list and bucket_cols_list:
+                part_type = "PARTITIONED_AND_BUCKETED"
+                part_cols = f"PART: {','.join(partition_cols_list)} | BUCKET: {','.join(bucket_cols_list)}"
+            elif partition_cols_list:
+                part_type = "PARTITIONED"
+                part_cols = ",".join(partition_cols_list)
+            elif bucket_cols_list:
+                part_type = "BUCKETED"
+                part_cols = ",".join(bucket_cols_list)
+            else:
+                part_type = "NONE"
+                part_cols = "N/A"
 
-            if is_iceberg:
-                final_type = "ICEBERG"
-            elif is_trino:
-                final_type = "TRINO"
+            # --- LÓGICA DE WRITE_FORMAT E TABLE_TYPE (CORRIGIDA) ---
+            all_keys_str = "|".join(raw_meta.keys())
+            input_format = next(
+                (v for k, v in raw_meta.items() if "inputformat" in k), ""
+            )
+            serde_lib = next(
+                (v for k, v in raw_meta.items() if "serde library" in k), ""
+            )
 
-            # --- LÓGICA DE IDENTIFICAÇÃO DO WRITE_FORMAT ---
-            input_format = find_val("inputformat") or ""
-            serde_lib = find_val("serde library") or ""
-
-            # Inicializamos como desconhecido
-            write_format = "UNKNOWN"
-
-            # Hierarquia de Identificação:
-            if raw_meta.get("table_type") == "ICEBERG":
-                # Coleta o valor da sub-chave write.format.default (ex: parquet, orc)
+            # Identificação de Tipo e Formato
+            if (
+                "table_type" in all_keys_str
+                and raw_meta.get("table_type", "").upper() == "ICEBERG"
+            ):
+                t_type = "ICEBERG"
                 write_format = (
                     f"ICEBERG ({raw_meta.get('write.format.default', 'parquet')})"
                 )
-            elif "trino_version" in raw_meta:
-                write_format = "TRINO"
+            elif "trino_version" in all_keys_str:
+                t_type = "TRINO"
+                write_format = "TRINO (PARQUET)"
             elif "ParquetInputFormat" in input_format:
+                t_type = "EXTERNAL"
                 write_format = "PARQUET"
             elif "OrcInputFormat" in input_format:
+                t_type = "EXTERNAL"
                 write_format = "ORC"
             elif "AvroContainerInputFormat" in input_format:
+                t_type = "EXTERNAL"
                 write_format = "AVRO"
-            elif "LazySimpleSerDe" in serde_lib:
-                write_format = "TEXT/CSV"
+            else:
+                t_type = raw_meta.get("table type") or t_type_catalog
+                write_format = (
+                    "TEXT/CSV" if "LazySimpleSerDe" in serde_lib else "UNKNOWN"
+                )
 
             # --- Extração de Metadados ---
             owner = find_val("owner") or "UNKNOWN"
@@ -318,27 +340,15 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
             last_access = find_val("lastaccesstime") or "UNKNOWN"
 
             meta_loc = (
-                raw_meta.get("metadata_location")
-                if "ICEBERG" in str(final_type).lower()
-                else "N/A"
+                raw_meta.get("metadata_location") if "ICEBERG" in str(t_type) else "N/A"
             )
-
-            part_type = (
-                "PARTITIONED"
-                if (
-                    "partition information" in str(raw_meta.keys())
-                    or find_val("partition column")
-                )
-                else "NONE"
-            )
-            part_cols = find_val("partition column") or None
 
             return (
                 str(uuid),
                 str(owner),
                 str(db_name),
                 str(table_name),
-                str(final_type).upper(),
+                str(t_type).upper(),
                 str(write_format),
                 str(part_type),
                 str(part_cols),
@@ -533,6 +543,30 @@ def aggregate_and_save(df_raw_files, df_catalog_meta, target_table_name: str) ->
         .select(*final_column_order)
     )
 
+    # Garantimos que os tipos de dados estão corretos para o Iceberg
+    df_final = df_final.select(
+        F.col("uuid").cast("string"),
+        F.col("owner").cast("string"),
+        F.col("db_name").cast("string"),
+        F.col("table_name").cast("string"),
+        F.col("table_type").cast("string"),
+        F.col("write_format").cast("string"),
+        F.col("partitioning_type").cast("string"),
+        F.col("partitioning_cols").cast("string"),
+        F.col("num_rows").cast("string"),
+        F.col("total_files_count").cast("long"),
+        F.col("total_size_bytes").cast("long"),
+        F.col("small_files_count").cast("long"),
+        F.col("avg_file_size_bytes").cast("double"),
+        F.col("small_files_pct").cast("double"),
+        F.col("location").cast("string"),
+        F.col("metadata_location").cast("string"),
+        F.col("create_time").cast("string"),
+        F.col("last_access").cast("string"),
+        F.col("audit_timestamp").cast("timestamp"),
+        F.col("audit_date").cast("date"),
+    )
+
     # Preparação das infraestruturas de destino
     try:
         # Extrair o nome da base de dados de TARGET_TABLE (por exemplo, «sys_monitoring»)
@@ -547,7 +581,7 @@ def aggregate_and_save(df_raw_files, df_catalog_meta, target_table_name: str) ->
         # O formato Iceberg irá gerir o esquema e os metadados automaticamente
         df_final.write.format("iceberg").partitionBy("audit_date").mode(
             "append"
-        ).saveAsTable(target_table_name)
+        ).option("mergeSchema", "true").saveAsTable(target_table_name)
 
         logger.info("O processo de auditoria foi concluído com sucesso.")
 
