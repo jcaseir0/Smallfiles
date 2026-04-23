@@ -491,8 +491,14 @@ def aggregate_and_save(df_raw_files, df_catalog_meta, target_table_name: str) ->
     """
     logger.info("Agregando métricas e calcular percentagens de integridade...")
 
-    # 5 partições são suficientes para consolidar os metadados e gerar poucos arquivos físicos.
+    # Configurações de estabilidade para escrita em Cloud Storage (S3/ADLS)
     spark.conf.set("spark.sql.shuffle.partitions", "5")
+    spark.conf.set("spark.sql.iceberg.handle-timestamp-without-timezone", "true")
+    # Protocolo de commit robusto para evitar leaf node error
+    spark.conf.set(
+        "spark.sql.sources.commitProtocolClass",
+        "org.apache.spark.internal.io.cloud.PathOutputCommitProtocol",
+    )
 
     # Agrega os dados físicos por tabela
     df_physical = df_raw_files.groupBy("db_name", "table_name").agg(
@@ -503,48 +509,29 @@ def aggregate_and_save(df_raw_files, df_catalog_meta, target_table_name: str) ->
         F.max("s3_last_modified").alias("actual_last_access"),
     )
 
-    # Define a ordem final desejada das colunas, colocando métricas físicas após os metadados
-    final_column_order = [
-        "uuid",
-        "owner",
-        "db_name",
-        "table_name",
-        "table_type",
-        "write_format",
-        "partitioning_type",
-        "partitioning_cols",
-        "num_rows",
-        "total_files_count",
-        "total_size_bytes",
-        "small_files_count",
-        "avg_file_size_bytes",
-        "small_files_pct",
-        "location",
-        "metadata_location",
-        "create_time",
-        "last_access",
-        "audit_timestamp",
-        "audit_date",
-    ]
+    # Join com os metadados e lógica de coalesce para last_access
+    df_joined = df_catalog_meta.join(df_physical, ["db_name", "table_name"], "left")
 
-    # Join com os metadados do catálogo coletados no início
+    # Cálculo de métricas com tratamento de divisões por zero e nulos
     df_final = (
-        df_catalog_meta.join(df_physical, ["db_name", "table_name"], "left")
-        .withColumn("audit_timestamp", F.current_timestamp())
+        df_joined.withColumn("audit_timestamp", F.current_timestamp())
+        .withColumn("audit_date", F.to_date(F.current_timestamp()))
         .withColumn(
             "last_access", F.coalesce(F.col("actual_last_access"), F.col("last_access"))
         )
         .withColumn(
             "small_files_pct",
-            F.round((F.col("small_files_count") / F.col("total_files_count")) * 100, 2),
+            F.when(
+                F.col("total_files_count") > 0,
+                F.round(
+                    (F.col("small_files_count") / F.col("total_files_count")) * 100, 2
+                ),
+            ).otherwise(0.0),
         )
-        # COLUNA DE DATA PARA PARTIÇÃO
-        .withColumn("audit_date", F.to_date(F.col("audit_timestamp")))
-        .select(*final_column_order)
     )
 
     # Garantimos que os tipos de dados estão corretos para o Iceberg
-    df_final = df_final.select(
+    df_persistence = df_final.select(
         F.col("uuid").cast("string"),
         F.col("owner").cast("string"),
         F.col("db_name").cast("string"),
@@ -575,15 +562,18 @@ def aggregate_and_save(df_raw_files, df_catalog_meta, target_table_name: str) ->
         logger.info(f"Verificar se a base de dados {target_db} existe...")
         spark.sql(f"CREATE DATABASE IF NOT EXISTS {target_db}")
 
-        logger.info(f"Guardar os resultados na tabela {target_table_name}...")
+        logger.info(f"Iniciando gravação na tabela {target_table_name}...")
 
-        # Utilizar «saveAsTable» em vez de «save» para registar a tabela no Metastore
-        # O formato Iceberg irá gerir o esquema e os metadados automaticamente
-        df_final.write.format("iceberg").partitionBy("audit_date").mode(
+        # Escrita Iceberg com mergeSchema para suportar evolução
+        df_persistence.write.format("iceberg").partitionBy("audit_date").mode(
             "append"
         ).option("mergeSchema", "true").saveAsTable(target_table_name)
 
-        logger.info("O processo de auditoria foi concluído com sucesso.")
+        # Ação que força o Driver a esperar o commit físico no S3 antes de continuar
+        logger.info("Sincronizando metadados da tabela...")
+        final_count = spark.table(target_table_name).count()
+
+        logger.info(f"Auditoria concluída com sucesso. Registros totais: {final_count}")
 
     except Exception as e:
         logger.error(f"Erro crítico durante a agregação e salvamento: {str(e)}")
@@ -635,7 +625,8 @@ if __name__ == "__main__":
         spark = get_spark_session()
 
         # Obter caminho do esquema usando a nova função
-        schema_path = get_schema_path(logger, "lakehouse_health_history")
+        table_name = DEFAULT_TARGET_TABLE.split(".")[-1]
+        schema_path = get_schema_path(logger, table_name)
         logger.info(f"Caminho do arquivo de esquema definido: {schema_path}")
 
         # Define o tamanho dinamicamente
@@ -661,3 +652,6 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"FALHA CRÍTICA NO JOB: {str(e)}", exc_info=True)
         raise
+    finally:
+        # O container encerrará organicamente após o fim do script
+        pass
