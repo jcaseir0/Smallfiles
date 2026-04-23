@@ -35,15 +35,17 @@ Após a criação, aparecerá uma linha com o novo repositório criado e o **Sta
 5.  Clique no link **Add from Repository** e selecione o arquivo de dentro do diretório `smallfiles` > `cde` > Selecione o arquivo `lakehouse_audit_pt.py` e clique em **Select File**.
 6.  **Arguments:** Informe o tamanho do arquivo pequeno (ex: `10` em Megabytes). Se vazio, o padrão será `5MB`.
 7.  **Spark Configurations:**
-    * `spark.sql.iceberg.handle-timestamp-without-timezone`: `true`
-    * `spark.sql.shuffle.partitions`: `5` (Evita geração de arquivos pequenos na tabela de saída).
+    * spark.sql.iceberg.handle-timestamp-without-timezone=true
+    * spark.memory.offHeap.enabled=true
+    * spark.memory.offHeap.size=2g
+    * spark.executor.memoryOverhead=2g
 8. Na sessão **Advanced Configuration**:
-   1. Executors: 10-15
-   2. Initial Executors: 2
+   1. Executors: 5-10
+   2. Initial Executors: 5
    3. Driver Cores: 2
-   4. Executor Cores: 4
-   5. Driver Memory: 2
-   6. Executor Memory: 4
+   4. Executor Cores: 2
+   5. Driver Memory: 4
+   6. Executor Memory: 8
 9.  Na sessão **Schedule**, utilizaremos a seguinte configuração:
     * **Basic**
     * Every `year`on `every day`of `every month` at `22`:`0`

@@ -7,6 +7,7 @@
     { "name": "db_name", "type": "string", "comment": "Nome do banco de dados onde a tabela reside." },
     { "name": "table_name", "type": "string", "comment": "Nome da tabela auditada." },
     { "name": "table_type", "type": "string", "comment": "Tipo da tabela (ex: MANAGED, EXTERNAL, ICEBERG)." },
+    { "name": "write_format", "type": "string", "nullable": true, "comment": "Formato de escrita detectado (Iceberg, Parquet, ORC, AVRO, etc)"},
     { "name": "partitioning_type", "type": "string", "comment": "Tipo de particionamento: PARTITIONED, BUCKETED ou NONE." },
     { "name": "partitioning_cols", "type": "string", "comment": "Lista de colunas utilizadas para particionamento ou bucketing." },
     { "name": "num_rows", "type": "string", "comment": "Número de linhas estatísticas registradas no catálogo." },

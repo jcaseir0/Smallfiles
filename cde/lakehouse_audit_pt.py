@@ -21,12 +21,15 @@
 # VERSION: 2.7
 # DESCRIPTION: Lakehouse Health & Metadata Audit for Cloudera Data Engineering.
 # Release Notes:
-# - v2.7.2: Correção na lógica de extração atual que estão causando os valores NULL e as falhas nas métricas:
+# - v2.7.3: Correção na lógica de extração atual que estão causando os valores NULL e as falhas nas métricas:
 #  .0: Incompatibilidade de Schema (O Desvio de Colunas)
 #  .1: Nova Função de Geração de UUID para garantir a unicidade e rastreabilidade de cada tabela auditada.
 #  .0: Falha na captura de numRows
 #  .0: Métricas Físicas com -1
 #  .2: Correção do erro CONTEXT_ONLY_VALID_ON_DRIVER causado pelo uso de SparkSession dentro de funções executadas em Workers (mapPartitions).
+#  .3: Adição do argumento 2 para alteração do nome padrão da tabela de destino, permitindo flexibilidade total sem necessidade de editar o código.
+#  .3: Correção da coleta de metadados da coluna table_type.
+#  .3: Adição de nova coluna chamada write_format para identificar o formato de escrita da tabela (ex: Parquet, ORC, AVRO, CSV).
 # - v2.6: Refatoração completa para otimização de performance e escalabilidade - estável.
 # - v2.5: Correção de bugs e melhorias na coleta de metadados e adição de manutenção automática da tabela Iceberg.
 # - v2.4: Implementação de logging detalhado e tratamento de erros robustoo.
@@ -56,10 +59,48 @@ logger.info(
     "##### Variáveis globais padrão definidas (podem ser sobrescritas por argumentos do Job) #####\n"
     "##### DEFAULT_SMALL_FILE_SIZE_MB = 5                                                    #####\n"
     "##### TARGET_TABLE = 'sys_monitoring.lakehouse_health_history'                          #####\n"
+    "##### Para alterar, no campo Arguments do seu Job no CDE, adicione:                     #####\n"
+    "##### 1º Argumento: Tamanho do arquivo pequeno (MB)                                     #####\n"
+    "##### 2º Argumento: Nome da tabela de destino (banco.tabela)                            #####\n"
+    "##### Exemplo 1 (Alterando ambos): 10 analytics.minha_tabela_auditoria                  #####\n"
+    "##### Exemplo 2 (Alterando apenas o tamanho do arquivo): 10                             #####\n"
+    "##### Exemplo 3 (Alterando o nome da tabela): 5 analytics.health_check_v2               #####\n"
     "#############################################################################################"
 )
 DEFAULT_SMALL_FILE_SIZE_MB = 5
-TARGET_TABLE = "sys_monitoring.lakehouse_health_history"
+DEFAULT_TARGET_TABLE = "sys_monitoring.lakehouse_health_history"
+
+
+def get_job_arguments() -> tuple:
+    """
+    Captura os argumentos passados ao Job do CDE.
+
+    Args:
+        Argumento 1: Tamanho do arquivo pequeno (MB)
+        Argumento 2: Nome da tabela de destino (banco.tabela)
+
+    Returns:
+        tuple: (size_mb, target_table) onde size_mb é o tamanho limite para arquivos pequenos e target_table é o nome da tabela de destino para os resultados.
+    """
+    size_mb = DEFAULT_SMALL_FILE_SIZE_MB
+    target_table = DEFAULT_TARGET_TABLE
+
+    # Verifica o primeiro argumento (Tamanho MB)
+    if len(sys.argv) > 1:
+        try:
+            size_mb = int(sys.argv[1])
+            logger.info(f"Argumento 1 recebido (Tamanho MB): {size_mb}")
+        except ValueError:
+            logger.warning(f"Argumento 1 inválido. Usando padrão: {size_mb}MB")
+
+    # Verifica o segundo argumento (Nome da Tabela)
+    if len(sys.argv) > 2:
+        target_table = sys.argv[2]
+        logger.info(f"Argumento 2 recebido (Tabela Destino): {target_table}")
+    else:
+        logger.info(f"Argumento 2 não fornecido. Usando padrão: {target_table}")
+
+    return size_mb, target_table
 
 
 def get_schema_path(
@@ -162,6 +203,7 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
             StructField("db_name", StringType(), True),
             StructField("table_name", StringType(), True),
             StructField("table_type", StringType(), True),
+            StructField("write_format", StringType(), True),
             StructField("partitioning_type", StringType(), True),
             StructField("partitioning_cols", StringType(), True),
             StructField("num_rows", StringType(), True),
@@ -200,7 +242,11 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
             # Consulta individual (Thread-safe no Spark Driver)
             desc_df = spark.sql(f"DESCRIBE EXTENDED {db_name}.{table_name}")
             raw_meta = {
-                str(r["col_name"]).strip().lower(): str(r["data_type"]).strip()
+                str(r["col_name"])
+                .replace(":", "")
+                .strip()
+                .lower(): str(r["data_type"])
+                .strip()
                 for r in desc_df.collect()
                 if r["col_name"]
             }
@@ -226,17 +272,54 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
             else:
                 uuid = catalog_uuid
 
+            # --- LÓGICA HIERÁRQUICA DE TABLE_TYPE ---
+            # 1. Valor base do Describe
+            base_type = find_val("table type") or t_type_catalog
+            final_type = base_type
+
+            # 2. Verificação de sub-chaves nos Table Parameters
+            is_iceberg = raw_meta.get("table_type") == "ICEBERG"
+            is_trino = "trino_version" in raw_meta
+
+            if is_iceberg:
+                final_type = "ICEBERG"
+            elif is_trino:
+                final_type = "TRINO"
+
+            # --- LÓGICA DE IDENTIFICAÇÃO DO WRITE_FORMAT ---
+            input_format = find_val("inputformat") or ""
+            serde_lib = find_val("serde library") or ""
+
+            # Inicializamos como desconhecido
+            write_format = "UNKNOWN"
+
+            # Hierarquia de Identificação:
+            if raw_meta.get("table_type") == "ICEBERG":
+                # Coleta o valor da sub-chave write.format.default (ex: parquet, orc)
+                write_format = (
+                    f"ICEBERG ({raw_meta.get('write.format.default', 'parquet')})"
+                )
+            elif "trino_version" in raw_meta:
+                write_format = "TRINO"
+            elif "ParquetInputFormat" in input_format:
+                write_format = "PARQUET"
+            elif "OrcInputFormat" in input_format:
+                write_format = "ORC"
+            elif "AvroContainerInputFormat" in input_format:
+                write_format = "AVRO"
+            elif "LazySimpleSerDe" in serde_lib:
+                write_format = "TEXT/CSV"
+
             # --- Extração de Metadados ---
-            owner = find_val("owner:") or find_val("owner") or "UNKNOWN"
+            owner = find_val("owner") or "UNKNOWN"
             num_rows = raw_meta.get("numrows") or raw_meta.get("num_rows") or "0"
-            t_type = find_val("table type") or t_type_catalog
-            loc = find_val("location:") or find_val("location") or "UNKNOWN"
-            create_time = find_val("createtime:") or find_val("created time")
-            last_access = find_val("lastaccesstime:") or "UNKNOWN"
+            loc = find_val("location") or "UNKNOWN"
+            create_time = find_val("createtime") or find_val("created time")
+            last_access = find_val("lastaccesstime") or "UNKNOWN"
 
             meta_loc = (
                 raw_meta.get("metadata_location")
-                if "iceberg" in str(t_type).lower()
+                if "ICEBERG" in str(final_type).lower()
                 else "N/A"
             )
 
@@ -255,7 +338,8 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
                 str(owner),
                 str(db_name),
                 str(table_name),
-                str(t_type),
+                str(final_type).upper(),
+                str(write_format),
                 str(part_type),
                 str(part_cols),
                 str(num_rows),
@@ -268,8 +352,7 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
             return None
 
     # 3. Execução em paralelo usando ThreadPoolExecutor
-    # Usamos 20 threads para não sobrecarregar o Metastore, mas acelerar o I/O
-    all_tables_metadata = []
+    # Usamos 20 threads para não sobrecarregar o Metastore, mas acelerar o I/O de consultas individuais.
     with ThreadPoolExecutor(max_workers=20) as executor:
         results = list(executor.map(fetch_table_details, all_tables_list))
 
@@ -362,7 +445,7 @@ def list_files_distributed(
                         dt_object = datetime.fromtimestamp(m_time_ms / 1000.0)
                         date_str = dt_object.strftime("%Y-%m-%d %H:%M:%S")
                         is_small = 1 if 0 < size < current_threshold else 0
-                        results.append((db, table, loc, size, is_small, date_str))
+                        yield ((db, table, loc, size, is_small, date_str))
                 else:
                     # Caminho não existe
                     results.append((db, table, loc, -2, 0, "1900-01-01 00:00:00"))
@@ -387,7 +470,7 @@ def list_files_distributed(
     return locations_rdd.mapPartitions(process_partition).toDF(file_schema)
 
 
-def aggregate_and_save(df_raw_files, df_catalog_meta) -> None:
+def aggregate_and_save(df_raw_files, df_catalog_meta, target_table_name: str) -> None:
     """
     Consolida as métricas por tabela e armazena-as no formato Iceberg.
     Assegura que a base de dados e a tabela de destino são criadas, caso não existam.
@@ -417,6 +500,7 @@ def aggregate_and_save(df_raw_files, df_catalog_meta) -> None:
         "db_name",
         "table_name",
         "table_type",
+        "write_format",
         "partitioning_type",
         "partitioning_cols",
         "num_rows",
@@ -452,18 +536,18 @@ def aggregate_and_save(df_raw_files, df_catalog_meta) -> None:
     # Preparação das infraestruturas de destino
     try:
         # Extrair o nome da base de dados de TARGET_TABLE (por exemplo, «sys_monitoring»)
-        target_db = TARGET_TABLE.split(".")[0]
+        target_db = target_table_name.split(".")[0]
 
         logger.info(f"Verificar se a base de dados {target_db} existe...")
         spark.sql(f"CREATE DATABASE IF NOT EXISTS {target_db}")
 
-        logger.info(f"Guardar os resultados na tabela {TARGET_TABLE}...")
+        logger.info(f"Guardar os resultados na tabela {target_table_name}...")
 
         # Utilizar «saveAsTable» em vez de «save» para registar a tabela no Metastore
         # O formato Iceberg irá gerir o esquema e os metadados automaticamente
         df_final.write.format("iceberg").partitionBy("audit_date").mode(
             "append"
-        ).saveAsTable(TARGET_TABLE)
+        ).saveAsTable(target_table_name)
 
         logger.info("O processo de auditoria foi concluído com sucesso.")
 
@@ -521,20 +605,20 @@ if __name__ == "__main__":
         logger.info(f"Caminho do arquivo de esquema definido: {schema_path}")
 
         # Define o tamanho dinamicamente
-        SMALL_FILE_SIZE_MB = get_small_file_threshold()
-        SMALL_FILE_THRESHOLD_BYTES = SMALL_FILE_SIZE_MB * 1024 * 1024
+        MB_LIMIT, TARGET_TABLE_NAME = get_job_arguments()
+        BYTE_LIMIT = MB_LIMIT * 1024 * 1024
 
         # Passo 1: Catálogo
         df_meta = get_catalog_metadata(spark)
 
         # Passo 2: Listagem Física
-        df_files = list_files_distributed(spark, df_meta, SMALL_FILE_THRESHOLD_BYTES)
+        df_files = list_files_distributed(spark, df_meta, BYTE_LIMIT)
 
         # Passo 3: Agregação e Escrita
-        aggregate_and_save(df_files, df_meta)
+        aggregate_and_save(df_files, df_meta, TARGET_TABLE_NAME)
 
         # Passo 4: Manutenção Automática da Tabela Iceberg
-        run_iceberg_maintenance(spark, TARGET_TABLE)
+        run_iceberg_maintenance(spark, TARGET_TABLE_NAME)
 
         # Log do tempo total de execução para monitoramento de performance
         duration = datetime.now() - start_time
