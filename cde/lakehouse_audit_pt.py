@@ -16,29 +16,10 @@
 # AUTHOR: João Caseiro
 # EMAIL: jcaseiro@cloudera.com
 # CREATED: 2026-04-08
-# LAST MODIFIED: 2026-04-21
-# ---------------------------------------------------------------------------------
-# VERSION: 2.7
+# VERSION: 3.0.0
 # DESCRIPTION: Lakehouse Health & Metadata Audit for Cloudera Data Engineering.
-# Release Notes:
-# - v2.7.4: Correção na lógica de extração atual que estão causando os valores NULL e as falhas nas métricas:
-#  .0: Incompatibilidade de Schema (O Desvio de Colunas)
-#  .1: Nova Função de Geração de UUID para garantir a unicidade e rastreabilidade de cada tabela auditada.
-#  .0: Falha na captura de numRows
-#  .0: Métricas Físicas com -1
-#  .2: Correção do erro CONTEXT_ONLY_VALID_ON_DRIVER causado pelo uso de SparkSession dentro de funções executadas em Workers (mapPartitions).
-#  .3: Adição do argumento 2 para alteração do nome padrão da tabela de destino, permitindo flexibilidade total sem necessidade de editar o código.
-#  .3: Correção da coleta de metadados da coluna table_type.
-#  .3: Adição de nova coluna chamada write_format para identificar o formato de escrita da tabela (ex: Parquet, ORC, AVRO, CSV).
-#  .4: Correção para o valor da coluna table_type.
-#  .4: Correção para colunas de partição e bucketing e definição da coluna responsável pelo tipo de particionamento.
-# - v2.6: Refatoração completa para otimização de performance e escalabilidade - estável.
-# - v2.5: Correção de bugs e melhorias na coleta de metadados e adição de manutenção automática da tabela Iceberg.
-# - v2.4: Implementação de logging detalhado e tratamento de erros robustoo.
-# - v2.3: Otimização da varredura de arquivos usando mapPartitions e broadcast de configurações.
-# - v2.2: Adição de argumentos dinâmicos para configuração de tamanho de arquivos pequenos.
-# - v2.1: Melhoria na definição de schema para evitar erros de inferência.
-# - v2.0: Refatoração completa do código para melhor organização e legibilidade.
+#
+# NOTE: For complete release history and details, see CHANGELOG.md
 # ---------------------------------------------------------------------------------
 
 import logging, sys, os
@@ -383,9 +364,6 @@ def list_files_distributed(
         spark (SparkSession): Instância ativa da sessão Spark.
         df_catalog (DataFrame): DataFrame contendo as localizações das tabelas para varredura.
         threshold_bytes (int): Tamanho limite em bytes para classificação de arquivo pequeno.
-
-    Returns:
-        DataFrame: Estatísticas físicas por tabela com scan em paralelo.
     """
     logger.info("Iniciando listagem física de arquivos no storage (Parallel Scan)...")
 
@@ -404,15 +382,12 @@ def list_files_distributed(
         "db_name", "table_name", "location"
     ).rdd.repartition(100)
 
-    def process_partition(rows: iter) -> list:
+    def process_partition(rows: iter) -> iter:
         """
-        Capturamos o Gateway Py4J que o Spark inicializa no Worker automaticamente
+        Executado nos Workers: Varre os arquivos transmitindo via yield para economizar memória.
 
         Args:
             rows (iterator): Iterador de linhas contendo (db_name, table_name, location) para cada tabela a ser processada.
-
-        Returns:
-            list: Lista de tuplas contendo (db_name, table_name, location, file_size, is_small) para cada arquivo encontrado.
         """
         logger.info("Processando partição de arquivos no Worker...")
 
@@ -436,7 +411,6 @@ def list_files_distributed(
         current_threshold = threshold_broadcast.value
 
         # Processamos cada linha da partição, listando os arquivos e coletando seus tamanhos
-        results = []
         for row in rows:
             db, table, loc = row
             if not loc or loc == "None":
@@ -458,11 +432,10 @@ def list_files_distributed(
                         yield ((db, table, loc, size, is_small, date_str))
                 else:
                     # Caminho não existe
-                    results.append((db, table, loc, -2, 0, "1900-01-01 00:00:00"))
+                    yield ((db, table, loc, -2, 0, "1900-01-01 00:00:00"))
             except Exception:
                 # Erro de permissão/acesso
-                results.append((db, table, loc, -1, 0, "1900-01-01 00:00:00"))
-        return results
+                yield ((db, table, loc, -1, 0, "1900-01-01 00:00:00"))
 
     # Definição do Schema para o DataFrame de arquivos brutos
     file_schema = StructType(

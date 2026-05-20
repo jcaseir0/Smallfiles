@@ -1,0 +1,43 @@
+# =========================================================================
+# GITIGNORE - LAKEHOUSE HEALTH AUDIT & CDE DEPLOYMENTS
+# =========================================================================
+
+# 1. Controle de Versões Antigas / Legadas (Solicitado)
+cde/older/
+
+# 2. Arquivos de Log e Execução Específicos do Cloudera Data Engineering (CDE)
+*.log
+cde-cli.json
+.cde/
+cde_output/
+*.log.*
+
+# 3. Cache e Binários do Python (Evita poluição no pull/push)
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.tox/
+.coverage
+htmlcov/
+
+# 4. Arquivos Temporários de checkpoint e estados do Spark / Hadoop
+.sparkStaging/
+metastore_db/
+derby.log
+*.crc
+.hdfs/
+target/
+
+# 5. Configurações de IDEs (VS Code, PyCharm, etc)
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+
+# 6. Arquivos de Sistema Operacional
+.DS_Store
+Thumbs.db
