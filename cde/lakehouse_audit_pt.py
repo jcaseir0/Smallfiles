@@ -59,8 +59,9 @@ def get_job_arguments() -> tuple:
     Captura os argumentos passados ao Job do CDE.
 
     Args:
-        Argumento 1: Tamanho do arquivo pequeno (MB)
-        Argumento 2: Nome da tabela de destino (banco.tabela)
+        - Sem argumentos (Usa padrões)
+        - Apenas 1 argumento: Pode ser o tamanho (Número) OU o nome da tabela (Texto)
+        - 2 argumentos: [tamanho_mb] [nome_tabela]
 
     Returns:
         tuple: (size_mb, target_table) onde size_mb é o tamanho limite para arquivos pequenos e target_table é o nome da tabela de destino para os resultados.
@@ -68,20 +69,38 @@ def get_job_arguments() -> tuple:
     size_mb = DEFAULT_SMALL_FILE_SIZE_MB
     target_table = DEFAULT_TARGET_TABLE
 
-    # Verifica o primeiro argumento (Tamanho MB)
-    if len(sys.argv) > 1:
-        try:
-            size_mb = int(sys.argv[1])
-            logger.info(f"Argumento 1 recebido (Tamanho MB): {size_mb}")
-        except ValueError:
-            logger.warning(f"Argumento 1 inválido. Usando padrão: {size_mb}MB")
+    num_args = len(sys.argv) - 1
 
-    # Verifica o segundo argumento (Nome da Tabela)
-    if len(sys.argv) > 2:
-        target_table = sys.argv[2]
-        logger.info(f"Argumento 2 recebido (Tabela Destino): {target_table}")
-    else:
-        logger.info(f"Argumento 2 não fornecido. Usando padrão: {target_table}")
+    if num_args == 1:
+        arg = sys.argv[1].strip()
+        # Se for apenas números, o usuário quis mudar o tamanho em MB
+        if arg.isdigit():
+            size_mb = int(arg)
+            logger.info(
+                f"Apenas 1 argumento recebido. Definindo tamanho_mb = {size_mb}"
+            )
+        # Se contiver letras ou ponto, o usuário quis passar apenas a tabela
+        else:
+            target_table = arg
+            logger.info(
+                f"Apenas 1 argumento recebido. Definindo tabela_destino = {target_table}"
+            )
+
+    elif num_args >= 2:
+        # Se passar dois argumentos, assume o padrão posicional: [Tamanho] [Tabela]
+        arg1 = sys.argv[1].strip()
+        arg2 = sys.argv[2].strip()
+
+        try:
+            size_mb = int(arg1)
+            logger.info(f"Argumento 1 recebido: tamanho_mb = {size_mb}")
+        except ValueError:
+            logger.warning(
+                f"Argumento 1 '{arg1}' não é um número válido. Mantendo padrão: {size_mb}"
+            )
+
+        target_table = arg2
+        logger.info(f"Argumento 2 recebido: tabela_destino = {target_table}")
 
     return size_mb, target_table
 
