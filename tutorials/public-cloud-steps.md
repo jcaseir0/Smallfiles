@@ -33,18 +33,20 @@ Após a criação, aparecerá uma linha com o novo repositório criado e o **Sta
 3.  **Name:** `metadata_audit_01`.
 4.  **Select Application File:** Selecione **Repository**
 5.  Clique no link **Add from Repository** e selecione o arquivo de dentro do diretório `smallfiles` > `cde` > Selecione o arquivo `lakehouse_audit_pt.py` e clique em **Select File**.
-6.  **Arguments:** Informe o tamanho do arquivo pequeno (ex: `10` em Megabytes). Se vazio, o padrão será `5MB`.
+6.  **Arguments:** Informe o tamanho do arquivo pequeno (ex: `10` em Megabytes) para o primeiro parâmetro. Se vazio, o padrão será `5MB`. E osegundo parametro clicanco no **+** para o nome da tabela (ex: `sys_monitoring.lakehouse_health_history_v3`). Se vazio, o padrão será `sys_monitoring.lakehouse_health_history`.
 7.  **Spark Configurations:**
     * spark.sql.iceberg.handle-timestamp-without-timezone=true
     * spark.memory.offHeap.enabled=true
     * spark.memory.offHeap.size=2g
     * spark.executor.memoryOverhead=2g
+    * spark.sql.shuffle.partitions=20
+    * spark.dynamicAllocation.enabled=false
 8. Na sessão **Advanced Configuration**:
-   1. Executors: 5-10
-   2. Initial Executors: 5
-   3. Driver Cores: 2
+   1. Executors: 15-15
+   2. Initial Executors: 15
+   3. Driver Cores: 4
    4. Executor Cores: 2
-   5. Driver Memory: 4
+   5. Driver Memory: 6
    6. Executor Memory: 8
 9.  Na sessão **Schedule**, utilizaremos a seguinte configuração:
     * **Basic**

@@ -246,30 +246,46 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
         """
         db_name, table_name, t_type_catalog = row
         try:
-            # Coleta metadados estruturados via Catalog para identificar colunas de partição
+            # 1. Busca colunas de partição de forma resiliente via catálogo
             partition_cols_list = []
             bucket_cols_list = []
             try:
                 columns = spark.catalog.listColumns(db_name, table_name)
                 partition_cols_list = [col.name for col in columns if col.isPartition]
                 bucket_cols_list = [col.name for col in columns if col.isBucket]
-            except Exception as e:
-                logger.debug(
-                    f"Falha ao ler colunas via catálogo para {db_name}.{table_name}: {str(e)}"
-                )
+            except Exception:
+                # Se falhar, continuamos e tentaremos identificar o particionamento via DESCRIBE
+                pass
 
-            # Consulta individual do Describe (Thread-safe no Spark Driver)
+            # 2. Consulta o Describe Extended e constrói um dicionário ultra-normalizado
             desc_df = spark.sql(f"DESCRIBE EXTENDED {db_name}.{table_name}")
-            raw_meta = {
-                str(r["col_name"])
-                .replace(":", "")
-                .strip()
-                .lower(): str(r["data_type"])
-                .strip()
-                for r in desc_df.collect()
-                if r["col_name"]
-            }
+            raw_meta = {}
 
+            for r in desc_df.collect():
+                col = str(r["col_name"] or "").strip()
+                val = str(r["data_type"] or "").strip()
+
+                # Normaliza caracteres invisíveis (\u00a0) muito comuns no HMS da Cloudera
+                col_norm = col.replace("\u00a0", " ").replace(":", "").strip().lower()
+                val_norm = val.replace("\u00a0", " ").strip()
+
+                if col_norm:
+                    raw_meta[col_norm] = val_norm
+                else:
+                    # Se col_name estiver em branco, significa que estamos dentro de 'Table Parameters'
+                    # Onde a linha vem no formato: "chave     valor" separados por tabulação ou múltiplos espaços
+                    parts = [p.strip() for p in val_norm.split("\t") if p.strip()]
+                    if len(parts) == 2:
+                        k_sub = parts[0].lower()
+                        v_sub = parts[1]
+                        raw_meta[k_sub] = v_sub
+                    elif " " in val_norm:
+                        # Fallback se vier separado por múltiplos espaços em vez de tabulação
+                        parts = [p.strip() for p in val_norm.split(" ") if p.strip()]
+                        if len(parts) >= 2:
+                            raw_meta[parts[0].lower()] = " ".join(parts[1:])
+
+            # Função auxiliar para encontrar valores específicos no dicionário de metadados, ignorando casos e espaços
             def find_val(search_key: str) -> str:
                 """
                 Função para encontrar um valor específico em raw_meta.
@@ -284,55 +300,26 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
                     (v for k, v in raw_meta.items() if search_key.lower() in k), None
                 )
 
-            # --- Lógica de UUID determinístico ---
-            catalog_uuid = find_val("uuid") or find_val("tableid")
-            if not catalog_uuid or catalog_uuid in ["None", "NULL", "N/A"]:
-                uuid = generate_table_uuid(db_name, table_name)
-            else:
-                uuid = catalog_uuid
-
-            # Tratamento de particionamento e bucketing usando a API de Catalog
-            if partition_cols_list and bucket_cols_list:
-                part_type = "PARTITIONED_AND_BUCKETED"
-                part_cols = f"PART: {','.join(partition_cols_list)} | BUCKET: {','.join(bucket_cols_list)}"
-            elif partition_cols_list:
-                part_type = "PARTITIONED"
-                part_cols = ",".join(partition_cols_list)
-            elif bucket_cols_list:
-                part_type = "BUCKETED"
-                part_cols = ",".join(bucket_cols_list)
-            else:
-                # Tenta uma última validação via string (caso listColumns tenha falhado mas exista a info no describe)
-                if "partition information" in str(raw_meta.keys()) or find_val(
-                    "partition column"
-                ):
-                    part_type = "PARTITIONED (CATALOG_FAULT)"
-                    part_cols = find_val("partition column") or "UNKNOWN"
-                else:
-                    part_type = "NONE"
-                    part_cols = "N/A"
-
-            # --- LÓGICA DE WRITE_FORMAT E TABLE_TYPE ---
+            # --- 1. IDENTIFICAÇÃO DE TIPO E FORMATO (LÓGICA HIERÁRQUICA) ---
             all_keys_str = "|".join(raw_meta.keys())
-            input_format = next(
-                (v for k, v in raw_meta.items() if "inputformat" in k), ""
-            )
-            serde_lib = next(
-                (v for k, v in raw_meta.items() if "serde library" in k), ""
-            )
+            input_format = find_val("inputformat") or ""
+            serde_lib = find_val("serde library") or ""
 
-            # Identificação de Tipo e Formato
-            if (
-                "table_type" in all_keys_str
-                and raw_meta.get("table_type", "").upper() == "ICEBERG"
-            ):
+            # Checa se nos parâmetros há menção explícita a Iceberg
+            is_iceberg = (
+                raw_meta.get("table_type", "").upper() == "ICEBERG"
+                or "iceberg" in serde_lib.lower()
+            )
+            is_trino = "trino_version" in all_keys_str
+
+            if is_iceberg:
                 t_type = "ICEBERG"
-                write_format = (
-                    f"ICEBERG ({raw_meta.get('write.format.default', 'parquet')})"
-                )
-            elif "trino_version" in all_keys_str:
+                # Coleta o write.format.default mapeado do Table Parameters (Ex: parquet)
+                fmt_default = raw_meta.get("write.format.default", "parquet")
+                write_format = f"ICEBERG ({fmt_default.upper()})"
+            elif is_trino:
                 t_type = "TRINO"
-                write_format = "TRINO (PARQUET)"
+                write_format = "TRINO"
             elif "ParquetInputFormat" in input_format:
                 t_type = "EXTERNAL"
                 write_format = "PARQUET"
@@ -343,30 +330,64 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
                 t_type = "EXTERNAL"
                 write_format = "AVRO"
             else:
-                t_type = raw_meta.get("table type") or t_type_catalog
+                # Fallback para o tipo base limpando o \u00a0
+                t_type = raw_meta.get("table type") or t_type_catalog or "EXTERNAL"
                 write_format = (
                     "TEXT/CSV" if "LazySimpleSerDe" in serde_lib else "UNKNOWN"
                 )
 
-            # --- Extração de Metadados ---
-            owner = find_val("owner") or "UNKNOWN"
+            # Limpeza estética do tipo de tabela (Remover _TABLE do final)
+            t_type = str(t_type).replace("_TABLE", "").upper()
+
+            # --- 2. EXTRAÇÃO DE METADADOS ADICIONAIS ---
+            owner = raw_meta.get("owner") or find_val("owner") or "UNKNOWN"
+
+            # Captura estatísticas reais de linhas (numRows mapeado do Table Parameters)
             num_rows = raw_meta.get("numrows") or raw_meta.get("num_rows") or "0"
-            loc = find_val("location") or "UNKNOWN"
-            create_time = find_val("createtime") or find_val("created time")
-            last_access = find_val("lastaccesstime") or "UNKNOWN"
+
+            loc = raw_meta.get("location") or find_val("location") or "UNKNOWN"
+            create_time = raw_meta.get("createtime") or find_val("create") or "UNKNOWN"
+            last_access = (
+                raw_meta.get("lastaccesstime") or find_val("lastaccess") or "UNKNOWN"
+            )
+
+            # Se for data padrão do Unix (vazia/desconfigurada no cluster), tratamos
+            if "1969" in str(last_access) or "1970" in str(last_access):
+                last_access = "UNKNOWN (NEVER ACCESSED)"
 
             meta_loc = (
                 raw_meta.get("metadata_location")
-                if "ICEBERG" in str(t_type)
-                else "NOT A ICEBERG TABLE"
+                if t_type == "ICEBERG"
+                else "NOT AN ICEBERG TABLE"
             )
+
+            # Se o UUID nativo do Iceberg/HMS existir no Parameters, nós usamos
+            uuid = (
+                raw_meta.get("uuid")
+                or find_val("tableid")
+                or generate_table_uuid(db_name, table_name)
+            )
+
+            # --- 3. PARTICIONAMENTO E BUCKETING ---
+            if partition_cols_list and bucket_cols_list:
+                part_type = "PARTITIONED_AND_BUCKETED"
+                part_cols = f"PART: {','.join(partition_cols_list)} | BUCKET: {','.join(bucket_cols_list)}"
+            elif partition_cols_list:
+                part_type = "PARTITIONED"
+                part_cols = ",".join(partition_cols_list)
+            elif bucket_cols_list:
+                part_type = "BUCKETED"
+                part_cols = ",".join(bucket_cols_list)
+            else:
+                part_type = "NONE"
+                part_cols = "N/A"
 
             return (
                 str(uuid),
                 str(owner),
                 str(db_name),
                 str(table_name),
-                str(t_type).upper(),
+                str(t_type),
                 str(write_format),
                 str(part_type),
                 str(part_cols),
@@ -377,7 +398,6 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
                 str(last_access),
             )
         except Exception as table_err:
-            # Logamos o erro específico da tabela em modo warning em vez de quebrar o lote completo
             logger.warning(
                 f"Erro ao coletar metadados detalhados de {row[0]}.{row[1]}: {str(table_err)}"
             )
@@ -385,7 +405,7 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
 
     # 3. Execução em paralelo usando ThreadPoolExecutor
     # Usamos 20 threads para não sobrecarregar o Metastore, mas acelerar o I/O de consultas individuais.
-    with ThreadPoolExecutor(max_workers=20) as executor:
+    with ThreadPoolExecutor(max_workers=100) as executor:
         results = list(executor.map(fetch_table_details, all_tables_list))
 
     # Filtra falhas e converte para DataFrame
@@ -425,7 +445,7 @@ def list_files_distributed(
     # 2. Paralelização: O segredo da performance está no repartition.
     locations_rdd = df_catalog.select(
         "db_name", "table_name", "location"
-    ).rdd.repartition(100)
+    ).rdd.repartition(400)
 
     def process_partition(rows: iter) -> iter:
         """
