@@ -188,6 +188,7 @@ def generate_table_uuid(db_name: str, table_name: str) -> str:
 def get_catalog_metadata(spark: SparkSession) -> StructType:
     """
     Coleta metadados detalhados do catálogo, de forma paralela, usando Multithreading no Driver.
+    Garante resiliência individual por tabela para evitar que erros de catálogo esvaziem o DataFrame.
 
     Args:
         spark (SparkSession): Instância ativa da sessão Spark.
@@ -225,9 +226,13 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
 
     all_tables_list = []
     for db in databases:
-        for t in spark.catalog.listTables(db):
-            if t.tableType != "VIEW":
-                all_tables_list.append((db, t.name, t.tableType))
+        try:
+            for t in spark.catalog.listTables(db):
+                if t.tableType != "VIEW":
+                    all_tables_list.append((db, t.name, t.tableType))
+        except Exception as e:
+            logger.warning(f"Não foi possível listar tabelas do banco {db}: {str(e)}")
+            continue
 
     def fetch_table_details(row: tuple) -> tuple:
         """
@@ -241,10 +246,19 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
         """
         db_name, table_name, t_type_catalog = row
         try:
-            # 1. Coleta metadados estruturados via Catalog para identificar colunas de partição
-            tbl_obj = spark.catalog.getTable(db_name, table_name)
+            # Coleta metadados estruturados via Catalog para identificar colunas de partição
+            partition_cols_list = []
+            bucket_cols_list = []
+            try:
+                columns = spark.catalog.listColumns(db_name, table_name)
+                partition_cols_list = [col.name for col in columns if col.isPartition]
+                bucket_cols_list = [col.name for col in columns if col.isBucket]
+            except Exception as e:
+                logger.debug(
+                    f"Falha ao ler colunas via catálogo para {db_name}.{table_name}: {str(e)}"
+                )
 
-            # 2. Consulta individual (Thread-safe no Spark Driver)
+            # Consulta individual do Describe (Thread-safe no Spark Driver)
             desc_df = spark.sql(f"DESCRIBE EXTENDED {db_name}.{table_name}")
             raw_meta = {
                 str(r["col_name"])
@@ -277,12 +291,7 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
             else:
                 uuid = catalog_uuid
 
-            # --- NOVA LÓGICA DE PARTICIONAMENTO E BUCKETING ---
-            # O Catalog identifica colunas de partição de forma nativa
-            columns = spark.catalog.listColumns(db_name, table_name)
-            partition_cols_list = [col.name for col in columns if col.isPartition]
-            bucket_cols_list = [col.name for col in columns if col.isBucket]
-
+            # Tratamento de particionamento e bucketing usando a API de Catalog
             if partition_cols_list and bucket_cols_list:
                 part_type = "PARTITIONED_AND_BUCKETED"
                 part_cols = f"PART: {','.join(partition_cols_list)} | BUCKET: {','.join(bucket_cols_list)}"
@@ -293,10 +302,17 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
                 part_type = "BUCKETED"
                 part_cols = ",".join(bucket_cols_list)
             else:
-                part_type = "NONE"
-                part_cols = "N/A"
+                # Tenta uma última validação via string (caso listColumns tenha falhado mas exista a info no describe)
+                if "partition information" in str(raw_meta.keys()) or find_val(
+                    "partition column"
+                ):
+                    part_type = "PARTITIONED (CATALOG_FAULT)"
+                    part_cols = find_val("partition column") or "UNKNOWN"
+                else:
+                    part_type = "NONE"
+                    part_cols = "N/A"
 
-            # --- LÓGICA DE WRITE_FORMAT E TABLE_TYPE (CORRIGIDA) ---
+            # --- LÓGICA DE WRITE_FORMAT E TABLE_TYPE ---
             all_keys_str = "|".join(raw_meta.keys())
             input_format = next(
                 (v for k, v in raw_meta.items() if "inputformat" in k), ""
@@ -340,7 +356,9 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
             last_access = find_val("lastaccesstime") or "UNKNOWN"
 
             meta_loc = (
-                raw_meta.get("metadata_location") if "ICEBERG" in str(t_type) else "N/A"
+                raw_meta.get("metadata_location")
+                if "ICEBERG" in str(t_type)
+                else "NOT A ICEBERG TABLE"
             )
 
             return (
@@ -358,7 +376,11 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
                 str(create_time),
                 str(last_access),
             )
-        except Exception:
+        except Exception as table_err:
+            # Logamos o erro específico da tabela em modo warning em vez de quebrar o lote completo
+            logger.warning(
+                f"Erro ao coletar metadados detalhados de {row[0]}.{row[1]}: {str(table_err)}"
+            )
             return None
 
     # 3. Execução em paralelo usando ThreadPoolExecutor
@@ -368,6 +390,10 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
 
     # Filtra falhas e converte para DataFrame
     all_tables_metadata = [r for r in results if r is not None]
+
+    logger.info(
+        f"Metadados extraídos com sucesso para {len(all_tables_metadata)} de {len(all_tables_list)} tabelas."
+    )
 
     return spark.createDataFrame(all_tables_metadata, schema=catalog_schema)
 
