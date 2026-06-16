@@ -16,7 +16,7 @@
 # AUTHOR: João Caseiro
 # EMAIL: jcaseiro@cloudera.com
 # CREATED: 2026-04-08
-# VERSION: 3.0.0
+# VERSION: 3.0.1
 # DESCRIPTION: Lakehouse Health & Metadata Audit for Cloudera Data Engineering.
 #
 # NOTE: For complete release history and details, see CHANGELOG.md
