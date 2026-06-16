@@ -4,6 +4,11 @@ Todos os marcos importantes e alterações incrementais deste projeto de Auditor
 
 O formato é baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.0.0/) e este projeto adere ao versionamento semântico.
 
+## [3.0.2] - 2026-06-16
+### Corrigido
+- Erro de parser sintático (`[PARSE_SYNTAX_ERROR] Syntax error at or near 'EXECUTE'`) na função de governança `run_iceberg_maintenance`. A sintaxe administrativa baseada no Impala (`ALTER TABLE ... EXECUTE`) foi substituída pelos procedimentos de chamada nativa do Spark SQL (`CALL spark_catalog.system...`).
+- Correção do cálculo interno do timestamp de expiração de snapshots antigos no S3, convertendo o parâmetro dinamicamente para milissegundos Unix aceitos pela API nativa do Iceberg no Spark.
+
 ## [3.0.1] - 2026-06-15
 ### Corrigido
 - Falha crítica que causava o desligamento inesperado do `SparkContext` (`Job cancelled because SparkContext was shut down`) devido ao excesso de concorrência de threads disparadas ao Py4J Gateway e ao Hive Metastore.

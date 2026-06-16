@@ -16,7 +16,7 @@
 # AUTHOR: João Caseiro
 # EMAIL: jcaseiro@cloudera.com
 # CREATED: 2026-04-08
-# VERSION: 3.0.1
+# VERSION: 3.0.2
 # DESCRIPTION: Lakehouse Health & Metadata Audit for Cloudera Data Engineering.
 #
 # NOTE: For complete release history and details, see CHANGELOG.md
@@ -631,17 +631,17 @@ def run_iceberg_maintenance(spark: SparkSession, table_name: str) -> None:
     try:
         # Compactação de arquivos pequenos (Small Files)
         logger.info("- Compactando arquivos de dados (rewrite_data_files)...")
-        spark.sql(f"ALTER TABLE {table_name} EXECUTE rewrite_data_files")
+        spark.sql(f"CALL spark_catalog.system.rewrite_data_files(table => '{table_name}')")
 
         # Otimização de metadados
         logger.info("- Otimizando manifestos de metadados (rewrite_manifests)...")
-        spark.sql(f"ALTER TABLE {table_name} EXECUTE rewrite_manifests")
+        spark.sql(f"CALL spark_catalog.system.rewrite_manifests(table => '{table_name}')")
 
         # Limpeza de histórico físico para economizar storage
         logger.info("- Expirando snapshots antigos (> 30 dias)...")
-        spark.sql(
-            f"ALTER TABLE {table_name} EXECUTE expire_snapshots(older_than = 'now() - 30d')"
-        )
+        import time
+        older_than_ms = int((time.time() - (30 * 24 * 60 * 60)) * 1000)
+        spark.sql(f"CALL spark_catalog.system.expire_snapshots(table => '{table_name}', older_than => TIMESTAMP WITH LOCAL TIME ZONE FROM_UNIXTIME({older_than_ms / 1000}))")
 
         logger.info("Manutenção finalizada com sucesso.")
 
