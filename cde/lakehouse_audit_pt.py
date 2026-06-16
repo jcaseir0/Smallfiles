@@ -16,7 +16,7 @@
 # AUTHOR: João Caseiro
 # EMAIL: jcaseiro@cloudera.com
 # CREATED: 2026-04-08
-# VERSION: 3.0.2
+# VERSION: 3.0.3
 # DESCRIPTION: Lakehouse Health & Metadata Audit for Cloudera Data Engineering.
 #
 # NOTE: For complete release history and details, see CHANGELOG.md
@@ -26,7 +26,7 @@ import logging, sys, os
 from datetime import datetime
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.types import StructType, StructField, StringType, LongType, DoubleType
+from pyspark.sql.types import StructType, StructField, StringType, LongType, DoubleType, TimestampType
 from concurrent.futures import ThreadPoolExecutor
 
 # 1. Configuração de Logging (Melhor prática para Verbose no CDE)
@@ -214,6 +214,8 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
             StructField("metadata_location", StringType(), True),
             StructField("create_time", StringType(), True),
             StructField("last_access", StringType(), True),
+            StructField("cat_num_files", LongType(), True),
+            StructField("cat_total_size", LongType(), True),
         ]
     )
 
@@ -269,19 +271,15 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
                 col_norm = col.replace("\u00a0", " ").replace(":", "").strip().lower()
                 val_norm = val.replace("\u00a0", " ").strip()
 
-                if col_norm:
+                if col_norm and not col_norm.startswith("#"):
                     raw_meta[col_norm] = val_norm
-                else:
-                    # Se col_name estiver em branco, significa que estamos dentro de 'Table Parameters'
-                    # Onde a linha vem no formato: "chave     valor" separados por tabulação ou múltiplos espaços
-                    parts = [p.strip() for p in val_norm.split("\t") if p.strip()]
-                    if len(parts) == 2:
-                        raw_meta[parts[0].lower()] = parts[1]
-                    elif " " in val_norm:
-                        # Fallback se vier separado por múltiplos espaços em vez de tabulação
-                        parts = [p.strip() for p in val_norm.split(" ") if p.strip()]
-                        if len(parts) >= 2:
-                            raw_meta[parts[0].lower()] = " ".join(parts[1:])
+                elif not col_norm and val_norm:
+                    # Tratamento das sub-chaves em Table Parameters (Separados por tabulação ou múltiplos espaços)
+                    parts = [p.strip() for p in val_norm.replace("\t", " ").split(" ") if p.strip()]
+                    if len(parts) >= 2:
+                        k_sub = parts[0].lower()
+                        v_sub = " ".join(parts[1:])
+                        raw_meta[k_sub] = v_sub
 
             # Função auxiliar para encontrar valores específicos no dicionário de metadados, ignorando casos e espaços
             def find_val(search_key: str) -> str:
@@ -300,42 +298,28 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
 
             # --- 1. IDENTIFICAÇÃO DE TIPO E FORMATO (LÓGICA HIERÁRQUICA) ---
             all_keys_str = "|".join(raw_meta.keys())
-            input_format = find_val("inputformat") or ""
             serde_lib = find_val("serde library") or ""
 
             # Checa se nos parâmetros há menção explícita a Iceberg
             is_iceberg = (
-                raw_meta.get("table_type", "").upper() == "ICEBERG"
-                or "iceberg" in serde_lib.lower()
+                raw_meta.get("table_type") == "ICEBERG" 
+                or "iceberg" in serde_lib.lower() 
+                or "iceberg" in all_keys_str
             )
             is_trino = "trino_version" in all_keys_str
 
             if is_iceberg:
                 t_type = "ICEBERG"
                 # Coleta o write.format.default mapeado do Table Parameters (Ex: parquet)
-                fmt_default = raw_meta.get("write.format.default", "parquet")
-                write_format = f"ICEBERG ({fmt_default.upper()})"
+                fmt_default = raw_meta.get("write.format.default") or "parquet"
+                write_format = fmt_default.upper()
             elif is_trino:
                 t_type = "TRINO"
-                write_format = "TRINO"
-            elif "ParquetInputFormat" in input_format:
-                t_type = "EXTERNAL"
-                write_format = "PARQUET"
-            elif "OrcInputFormat" in input_format:
-                t_type = "EXTERNAL"
-                write_format = "ORC"
-            elif "AvroContainerInputFormat" in input_format:
-                t_type = "EXTERNAL"
-                write_format = "AVRO"
+                write_format = "EXTERNAL (TRINO)"
             else:
-                # Fallback para o tipo base limpando o \u00a0
-                t_type = raw_meta.get("table type") or t_type_catalog or "EXTERNAL"
-                write_format = (
-                    "TEXT/CSV" if "LazySimpleSerDe" in serde_lib else "UNKNOWN"
-                )
-
-            # Limpeza estética do tipo de tabela (Remover _TABLE do final)
-            t_type = str(t_type).replace("_TABLE", "").upper()
+                raw_table_type = raw_meta.get("table type") or find_val("table type") or t_type_catalog
+                t_type = str(raw_table_type).replace("_TABLE", "").upper()
+                write_format = "TEXT/CSV" if "LazySimpleSerDe" in serde_lib else "UNKNOWN"
 
             # --- 2. EXTRAÇÃO DE METADADOS ADICIONAIS ---
             owner = raw_meta.get("owner") or find_val("owner") or "UNKNOWN"
@@ -345,27 +329,28 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
 
             loc = raw_meta.get("location") or find_val("location") or "UNKNOWN"
             create_time = raw_meta.get("createtime") or find_val("create") or "UNKNOWN"
-            last_access = (
-                raw_meta.get("lastaccesstime") or find_val("lastaccess") or "UNKNOWN"
-            )
+            last_access = raw_meta.get("lastaccesstime") or find_val("lastaccess") or "UNKNOWN"
 
             # Se for data padrão do Unix (vazia/desconfigurada no cluster), tratamos
             if "1969" in str(last_access) or "1970" in str(last_access):
                 last_access = "UNKNOWN (NEVER ACCESSED)"
 
-            meta_loc = (
-                raw_meta.get("metadata_location")
-                if t_type == "ICEBERG"
-                else "NOT AN ICEBERG TABLE"
-            )
+            # Captura o local do metadado JSON
+            meta_loc = raw_meta.get("metadata_location") or find_val("metadata_location") or "N/A"
 
             # Se o UUID nativo do Iceberg/HMS existir no Parameters, nós usamos
-            uuid = (
-                raw_meta.get("uuid")
-                or find_val("tableid")
-                or generate_table_uuid(db_name, table_name)
-            )
+            uuid = raw_meta.get("uuid") or find_val("tableid") or generate_table_uuid(db_name, table_name)
+            
+            # Extração de estatísticas internas de contingência (Catálogo)
+            cat_num_files = raw_meta.get("numfiles") or raw_meta.get("num_files")
+            cat_total_size = raw_meta.get("totalsize") or raw_meta.get("total_size")
 
+            try:
+                c_files = int(cat_num_files) if cat_num_files else None
+                c_size = int(cat_total_size) if cat_total_size else None
+            except ValueError:
+                c_files, c_size = None, None
+            
             # --- 3. PARTICIONAMENTO E BUCKETING ---
             if partition_cols_list and bucket_cols_list:
                 part_type = "PARTITIONED_AND_BUCKETED"
@@ -465,7 +450,7 @@ def list_files_distributed(
         for k, v in conf_broadcast.value.items():
             hadoop_conf.set(k, v)
 
-        # Agora podemos usar a API Hadoop FileSystem para acessar os arquivos
+        # Usar a API Hadoop FileSystem para acessar os arquivos
         Path = jvm.org.apache.hadoop.fs.Path
         FileSystem = jvm.org.apache.hadoop.fs.FileSystem
 
@@ -475,7 +460,7 @@ def list_files_distributed(
         # Processamos cada linha da partição, listando os arquivos e coletando seus tamanhos
         for row in rows:
             db, table, loc = row
-            if not loc or loc == "None":
+            if not loc or loc == "None" or "UNKNOWN" in loc:
                 continue
 
             try:
@@ -484,7 +469,9 @@ def list_files_distributed(
 
                 if fs.exists(h_path):
                     files_iter = fs.listFiles(h_path, True)
+                    has_files = False
                     while files_iter.hasNext():
+                        has_files = True
                         f = files_iter.next()
                         size = f.getLen()
                         m_time_ms = f.getModificationTime()
@@ -492,6 +479,8 @@ def list_files_distributed(
                         date_str = dt_object.strftime("%Y-%m-%d %H:%M:%S")
                         is_small = 1 if 0 < size < current_threshold else 0
                         yield ((db, table, loc, size, is_small, date_str))
+                    if not has_files:
+                        yield (db, table, loc, 0, 0, "1900-01-01 00:00:00")
                 else:
                     # Caminho não existe
                     yield ((db, table, loc, -2, 0, "1900-01-01 00:00:00"))
@@ -515,16 +504,17 @@ def list_files_distributed(
     return locations_rdd.mapPartitions(process_partition).toDF(file_schema)
 
 
-def aggregate_and_save(df_raw_files, df_catalog_meta, target_table_name: str) -> None:
+def aggregate_and_save(df_raw_files, df_catalog_meta, target_table_name: str, threshold_bytes: int) -> None:
     """
     Consolida as métricas por tabela e armazena-as no formato Iceberg.
-    Assegura que a base de dados e a tabela de destino são criadas, caso não existam.
+    Se a varredura do filesystem retornar erros (-1, -2) ou nulos,
+    aplica a regra de negócio baseando-se nos dados estruturados do Catálogo (numFiles / totalSize).
 
     Args:
         df_raw_files (DataFrame): DataFrame com dados brutos da listagem de arquivos.
         df_catalog_meta (DataFrame): DataFrame com metadados lógicos do catálogo.
     """
-    logger.info("Agregando métricas e calcular percentagens de integridade...")
+    logger.info("Agregando métricas e aplicando regras de cálculo estruturadas...")
 
     # Configurações de estabilidade para escrita em Cloud Storage (S3/ADLS)
     spark.conf.set("spark.sql.shuffle.partitions", "5")
@@ -535,83 +525,74 @@ def aggregate_and_save(df_raw_files, df_catalog_meta, target_table_name: str) ->
         "org.apache.spark.internal.io.cloud.PathOutputCommitProtocol",
     )
 
-    # Agrega os dados físicos por tabela
-    df_physical = df_raw_files.groupBy("db_name", "table_name").agg(
-        F.count("file_size").alias("total_files_count"),
-        F.sum("file_size").alias("total_size_bytes"),
-        F.sum("is_small").alias("small_files_count"),
-        F.avg("file_size").alias("avg_file_size_bytes"),
+    # 1. Agregação primária dos logs físicos do storage
+    df_physical = df_raw_files.filter("file_size >= 0").groupBy("db_name", "table_name").agg(
+        F.count("file_size").alias("fs_files_count"),
+        F.sum("file_size").alias("fs_size_bytes"),
+        F.sum("is_small").alias("fs_small_count"),
+        F.avg("file_size").alias("fs_avg_size"),
         F.max("s3_last_modified").alias("actual_last_access"),
     )
 
-    # Join com os metadados e lógica de coalesce para last_access
+    # 2. Join estrutural
     df_joined = df_catalog_meta.join(df_physical, ["db_name", "table_name"], "left")
 
-    # Cálculo de métricas com tratamento de divisões por zero e nulos
-    df_final = (
-        df_joined.withColumn("audit_timestamp", F.current_timestamp())
+    # 3. Cálculo das regras de negócio com fallback (Catálogo vs Filesystem)
+    df_calculated = (
+        df_joined
+        # Determinação do total de arquivos (Se fs for inválido ou nulo, pega o do catálogo)
+        .withColumn("total_files_count", 
+                    F.coalesce(F.col("fs_files_count"), F.col("cat_num_files"), F.lit(1L)))
+        
+        # Determinação do tamanho total em bytes
+        .withColumn("total_size_bytes", 
+                    F.coalesce(F.col("fs_size_bytes"), F.col("cat_total_size"), F.lit(0L)))
+        
+        # Cálculo do tamanho médio baseado na regra informada: totalSize / numFiles
+        .withColumn("avg_file_size_bytes", 
+                    F.when(F.col("total_files_count") > 0, F.col("total_size_bytes") / F.col("total_files_count"))
+                    .otherwise(0.0))
+        
+        # Cálculo de arquivos pequenos com base na regra: se avg_file_size_bytes < limite configurado
+        .withColumn("small_files_count", 
+                    F.when(F.col("fs_files_count").isNotNull(), F.col("fs_small_count"))
+                    .otherwise(F.when(F.col("avg_file_size_bytes") < threshold_bytes, F.col("total_files_count")).otherwise(0L)))
+        
+        # Porcentagem de arquivos pequenos
+        .withColumn("small_files_pct",
+                    F.when(F.col("total_files_count") > 0, F.round((F.col("small_files_count") / F.col("total_files_count")) * 100, 2))
+                    .otherwise(0.0))
+        
+        # Ajuste de Last Access e Timestamp estrito (Corrigido o formato de data para TIMESTAMP)
+        .withColumn("last_access", F.coalesce(F.col("actual_last_access"), F.col("last_access")))
+        .withColumn("audit_timestamp", F.current_timestamp())
         .withColumn("audit_date", F.to_date(F.current_timestamp()))
-        .withColumn(
-            "last_access", F.coalesce(F.col("actual_last_access"), F.col("last_access"))
-        )
-        .withColumn(
-            "small_files_pct",
-            F.when(
-                F.col("total_files_count") > 0,
-                F.round(
-                    (F.col("small_files_count") / F.col("total_files_count")) * 100, 2
-                ),
-            ).otherwise(0.0),
-        )
     )
 
-    # Garantimos que os tipos de dados estão corretos para o Iceberg
-    df_persistence = df_final.select(
-        F.col("uuid").cast("string"),
-        F.col("owner").cast("string"),
-        F.col("db_name").cast("string"),
-        F.col("table_name").cast("string"),
-        F.col("table_type").cast("string"),
-        F.col("write_format").cast("string"),
-        F.col("partitioning_type").cast("string"),
-        F.col("partitioning_cols").cast("string"),
-        F.col("num_rows").cast("string"),
-        F.col("total_files_count").cast("long"),
-        F.col("total_size_bytes").cast("long"),
-        F.col("small_files_count").cast("long"),
-        F.col("avg_file_size_bytes").cast("double"),
-        F.col("small_files_pct").cast("double"),
-        F.col("location").cast("string"),
-        F.col("metadata_location").cast("string"),
-        F.col("create_time").cast("string"),
-        F.col("last_access").cast("string"),
-        F.col("audit_timestamp").cast("timestamp"),
-        F.col("audit_date").cast("date"),
-    )
+    final_column_order = [
+        "uuid", "owner", "db_name", "table_name", "table_type", "write_format",
+        "partitioning_type", "partitioning_cols", "num_rows", "total_files_count",
+        "total_size_bytes", "small_files_count", "avg_file_size_bytes", "small_files_pct",
+        "location", "metadata_location", "create_time", "last_access", "audit_timestamp", "audit_date"
+    ]
 
-    # Preparação das infraestruturas de destino
+    df_persistence = df_calculated.select([F.col(c).cast(StringType() if c not in ["total_files_count", "total_size_bytes", "small_files_count", "avg_file_size_bytes", "small_files_pct", "audit_timestamp", "audit_date"] else 
+                                                    (LongType() if c in ["total_files_count", "total_size_bytes", "small_files_count"] else 
+                                                     (DoubleType() if c in ["avg_file_size_bytes", "small_files_pct"] else 
+                                                      (TimestampType() if c == "audit_timestamp" else F.coalesce())))) for c in final_column_order])
+
     try:
-        # Extrair o nome da base de dados de TARGET_TABLE (por exemplo, «sys_monitoring»)
         target_db = target_table_name.split(".")[0]
-
-        logger.info(f"Verificar se a base de dados {target_db} existe...")
         spark.sql(f"CREATE DATABASE IF NOT EXISTS {target_db}")
-
-        logger.info(f"Iniciando gravação na tabela {target_table_name}...")
-
-        # Escrita Iceberg com mergeSchema para suportar evolução
-        df_persistence.write.format("iceberg").partitionBy("audit_date").mode(
-            "append"
-        ).option("mergeSchema", "true").saveAsTable(target_table_name)
-
-        # Ação que força o Driver a esperar o commit físico no S3 antes de continuar
-        logger.info("Sincronizando metadados da tabela...")
-        final_count = spark.table(target_table_name).count()
-
-        logger.info(f"Auditoria concluída com sucesso. Registros totais: {final_count}")
-
+        
+        logger.info(f"Salvando dados na tabela Iceberg: {target_table_name}...")
+        df_persistence.write.format("iceberg").partitionBy("audit_date").mode("append").option("mergeSchema", "true").saveAsTable(target_table_name)
+        
+        # Força sincronização e aguarda finalização física
+        spark.table(target_table_name).count()
+        logger.info("Persistência finalizada com sucesso.")
     except Exception as e:
-        logger.error(f"Erro crítico durante a agregação e salvamento: {str(e)}")
+        logger.error(f"Erro ao salvar os dados: {str(e)}")
         raise
 
 
@@ -653,7 +634,7 @@ def run_iceberg_maintenance(spark: SparkSession, table_name: str) -> None:
 
 if __name__ == "__main__":
     start_time = datetime.now()
-    logger.info("=== INICIANDO LAKEHOUSE HEALTH AUDIT ===")
+    logger.info("=== INICIANDO LAKEHOUSE HEALTH AUDIT (VERSÃO 3.0.3) ===")
 
     try:
         # Criamos a SparkSession com suporte ao Hive para acessar o catálogo e realizar operações SQL
@@ -675,7 +656,7 @@ if __name__ == "__main__":
         df_files = list_files_distributed(spark, df_meta, BYTE_LIMIT)
 
         # Passo 3: Agregação e Escrita
-        aggregate_and_save(df_files, df_meta, TARGET_TABLE_NAME)
+        aggregate_and_save(df_files, df_meta, TARGET_TABLE_NAME, BYTE_LIMIT)
 
         # Passo 4: Manutenção Automática da Tabela Iceberg
         run_iceberg_maintenance(spark, TARGET_TABLE_NAME)

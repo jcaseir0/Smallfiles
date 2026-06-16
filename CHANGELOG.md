@@ -4,6 +4,21 @@ Todos os marcos importantes e alterações incrementais deste projeto de Auditor
 
 O formato é baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.0.0/) e este projeto adere ao versionamento semântico.
 
+## [3.0.3] - 2026-06-16
+### Corrigido
+- Falha na extração de metadados onde o campo `owner` retornava `UNKNOWN`, `table_type` vinha incorretamente como `MANAGED` e `create_time` falhava. O algoritmo de normalização foi reestruturado para limpar quebras de linha textuais, tabulações e remover de forma estrita o caractere oculto `\u00a0` injetado pelo terminal do Metastore da Cloudera.
+- Correção na identificação do formato de tabelas Iceberg (`write_format`) através do mapeamento direto da sub-chave `table_type` e extração automática do motor padrão de escrita (`write.format.default`).
+- Resolução do mapeamento do caminho físico dos metadados (`metadata_location`) para tabelas Iceberg, localizando dinamicamente o ficheiro `.json` estruturado no dump do Catálogo.
+
+### Adicionado
+- Mecanismo de **Métricas de Contingência (Fallback do Catálogo)**: Se a varredura física do sistema de arquivos (S3/HDFS) falhar, retornar nulo ou valores negativos (`-1`, `-2`) devido a barreiras de rede ou caminhos inacessíveis, o pipeline utiliza automaticamente os metadados estatísticos nativos salvos no HMS (`numFiles` e `totalSize`).
+- Lógica de cálculo automatizada para saúde de ficheiros baseada em regras de negócio estritas:
+  - `avg_file_size_bytes`: Calculado dinamicamente através da divisão matemática entre o tamanho total e o número total de ficheiros (`totalSize / NumFiles`).
+  - `small_files_count` / `small_files_pct`: Caso a listagem física não responda, o script avalia se o tamanho médio calculado da tabela é inferior ao limite (*threshold*) parametrizado para determinar o volume de ficheiros pequenos.
+
+### Modificado
+- Alteração do tipo de dados da coluna `audit_timestamp` no DataFrame de persistência Iceberg de `StringType` para `TimestampType`, garantindo o armazenamento nativo do carimbo de data/hora oficial do Spark (`YYYY-MM-DD HH:MM:SS.mmmmmm`) em substituição do formato textual simples.
+
 ## [3.0.2] - 2026-06-16
 ### Corrigido
 - Erro de parser sintático (`[PARSE_SYNTAX_ERROR] Syntax error at or near 'EXECUTE'`) na função de governança `run_iceberg_maintenance`. A sintaxe administrativa baseada no Impala (`ALTER TABLE ... EXECUTE`) foi substituída pelos procedimentos de chamada nativa do Spark SQL (`CALL spark_catalog.system...`).
