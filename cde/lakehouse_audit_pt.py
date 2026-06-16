@@ -542,11 +542,11 @@ def aggregate_and_save(df_raw_files, df_catalog_meta, target_table_name: str, th
         df_joined
         # Determinação do total de arquivos (Se fs for inválido ou nulo, pega o do catálogo)
         .withColumn("total_files_count", 
-                    F.coalesce(F.col("fs_files_count"), F.col("cat_num_files"), F.lit(1L)))
+                    F.coalesce(F.col("fs_files_count"), F.col("cat_num_files"), F.lit(1)))
         
         # Determinação do tamanho total em bytes
         .withColumn("total_size_bytes", 
-                    F.coalesce(F.col("fs_size_bytes"), F.col("cat_total_size"), F.lit(0L)))
+                    F.coalesce(F.col("fs_size_bytes"), F.col("cat_total_size"), F.lit(0)))
         
         # Cálculo do tamanho médio baseado na regra informada: totalSize / numFiles
         .withColumn("avg_file_size_bytes", 
@@ -556,7 +556,7 @@ def aggregate_and_save(df_raw_files, df_catalog_meta, target_table_name: str, th
         # Cálculo de arquivos pequenos com base na regra: se avg_file_size_bytes < limite configurado
         .withColumn("small_files_count", 
                     F.when(F.col("fs_files_count").isNotNull(), F.col("fs_small_count"))
-                    .otherwise(F.when(F.col("avg_file_size_bytes") < threshold_bytes, F.col("total_files_count")).otherwise(0L)))
+                    .otherwise(F.when(F.col("avg_file_size_bytes") < threshold_bytes, F.col("total_files_count")).otherwise(0)))
         
         # Porcentagem de arquivos pequenos
         .withColumn("small_files_pct",
