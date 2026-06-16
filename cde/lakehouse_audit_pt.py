@@ -250,7 +250,7 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
             partition_cols_list = []
             bucket_cols_list = []
             try:
-                columns = spark.catalog.listColumns(db_name, table_name)
+                columns = spark.catalog.listColumns(f"`{db_name}`.`{table_name}`")
                 partition_cols_list = [col.name for col in columns if col.isPartition]
                 bucket_cols_list = [col.name for col in columns if col.isBucket]
             except Exception:
@@ -258,7 +258,7 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
                 pass
 
             # 2. Consulta o Describe Extended e constrói um dicionário ultra-normalizado
-            desc_df = spark.sql(f"DESCRIBE EXTENDED {db_name}.{table_name}")
+            desc_df = spark.sql(f"DESCRIBE EXTENDED `{db_name}`.`{table_name}`")
             raw_meta = {}
 
             for r in desc_df.collect():
@@ -276,9 +276,7 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
                     # Onde a linha vem no formato: "chave     valor" separados por tabulação ou múltiplos espaços
                     parts = [p.strip() for p in val_norm.split("\t") if p.strip()]
                     if len(parts) == 2:
-                        k_sub = parts[0].lower()
-                        v_sub = parts[1]
-                        raw_meta[k_sub] = v_sub
+                        raw_meta[parts[0].lower()] = parts[1]
                     elif " " in val_norm:
                         # Fallback se vier separado por múltiplos espaços em vez de tabulação
                         parts = [p.strip() for p in val_norm.split(" ") if p.strip()]
@@ -403,9 +401,8 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
             )
             return None
 
-    # 3. Execução em paralelo usando ThreadPoolExecutor
-    # Usamos 20 threads para não sobrecarregar o Metastore, mas acelerar o I/O de consultas individuais.
-    with ThreadPoolExecutor(max_workers=100) as executor:
+    # 3. Execução em paralelo usando ThreadPoolExecutor para acelerar a coleta de metadados do catálogo
+    with ThreadPoolExecutor(max_workers=12) as executor:
         results = list(executor.map(fetch_table_details, all_tables_list))
 
     # Filtra falhas e converte para DataFrame
@@ -445,7 +442,7 @@ def list_files_distributed(
     # 2. Paralelização: O segredo da performance está no repartition.
     locations_rdd = df_catalog.select(
         "db_name", "table_name", "location"
-    ).rdd.repartition(400)
+    ).rdd.repartition(40)
 
     def process_partition(rows: iter) -> iter:
         """

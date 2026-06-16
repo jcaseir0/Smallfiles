@@ -29,7 +29,7 @@ Após a criação, aparecerá uma linha com o novo repositório criado e o **Sta
 ## 3. Criação do Job no CDE (Interface Web)
 
 1.  No console do **CDE**, vá em **Jobs** > Garanta que esteja no seu virtual cluster > **Create Job**.
-2.  **Job Type:** `Spark 3.4.5`.
+2.  **Job Type:** `Spark 3.5.4`.
 3.  **Name:** `metadata_audit_01`.
 4.  **Select Application File:** Selecione **Repository**
 5.  Clique no link **Add from Repository** e selecione o arquivo de dentro do diretório `smallfiles` > `cde` > Selecione o arquivo `lakehouse_audit_pt.py` e clique em **Select File**.
@@ -42,8 +42,8 @@ Após a criação, aparecerá uma linha com o novo repositório criado e o **Sta
     * spark.sql.shuffle.partitions=20
     * spark.dynamicAllocation.enabled=false
 8. Na sessão **Advanced Configuration**:
-   1. Executors: 15-15
-   2. Initial Executors: 15
+   1. Executors: 1
+   2. Initial Executors: 1
    3. Driver Cores: 4
    4. Executor Cores: 2
    5. Driver Memory: 6
