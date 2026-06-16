@@ -379,6 +379,8 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
                 str(meta_loc),
                 str(create_time),
                 str(last_access),
+                c_files, 
+                c_size,
             )
         except Exception as table_err:
             logger.warning(
