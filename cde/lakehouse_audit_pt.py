@@ -277,9 +277,13 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
                     # Tratamento das sub-chaves em Table Parameters (Separados por tabulação ou múltiplos espaços)
                     parts = [p.strip() for p in val_norm.replace("\t", " ").split(" ") if p.strip()]
                     if len(parts) >= 2:
-                        k_sub = parts[0].lower()
-                        v_sub = " ".join(parts[1:])
+                        k_sub = parts[0].replace(":", "").strip().lower()
+                        v_sub = " ".join(parts[1:]).strip()
                         raw_meta[k_sub] = v_sub
+                        
+            # VERBOSE / DEBUG: Imprime o dicionário mapeado da tabela alvo para auditoria visual no log do CDE
+            if table_name.lower() == "ida_insolvency_events":
+                logger.info(f"[VERBOSE-DEBUG] Chaves encontradas no dicionário para {db_name}.{table_name}: {list(raw_meta.keys())}")           
 
             # Função auxiliar para encontrar valores específicos no dicionário de metadados, ignorando casos e espaços
             def find_val(search_key: str) -> str:
@@ -322,8 +326,15 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
                 write_format = "TEXT/CSV" if "LazySimpleSerDe" in serde_lib else "UNKNOWN"
 
             # --- 2. EXTRAÇÃO DE METADADOS ADICIONAIS ---
-            owner = raw_meta.get("owner") or find_val("owner") or "UNKNOWN"
-
+            owner = "UNKNOWN"
+            for k, v in raw_meta.items():
+                if k.strip() == "owner":
+                    owner = v.strip()
+                    break
+            # Fallback secundário usando busca por substring se o mapeamento exato falhar
+            if owner == "UNKNOWN":
+                owner = find_val("owner") or "UNKNOWN"
+            
             # Captura estatísticas reais de linhas (numRows mapeado do Table Parameters)
             num_rows = raw_meta.get("numrows") or raw_meta.get("num_rows") or "0"
 
