@@ -276,6 +276,14 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
 
                 if col_norm and not col_norm.startswith("#"):
                     raw_meta[col_norm] = val_norm
+                    # Se a linha contiver as propriedades da tabela Iceberg, extrai chave-valor de dentro dos colchetes
+                    if "table properties" in col_norm and "[" in val_norm:
+                        prop_content = val_norm[val_norm.find("[")+1:val_norm.rfind("]")]
+                        # Divide propriedades por vírgula (ex: 'owner'='usr', 'write.format.default'='parquet')
+                        for prop in prop_content.split(","):
+                            if "=" in prop:
+                                p_k, p_v = prop.split("=", 1)
+                                raw_meta[p_k.replace("'", "").strip().lower()] = p_v.replace("'", "").strip()
                 elif not col_norm and val_norm:
                     # Tratamento das sub-chaves em Table Parameters (Separados por tabulação ou múltiplos espaços)
                     parts = [p.strip() for p in val_norm.replace("\t", " ").split(" ") if p.strip()]
@@ -312,6 +320,7 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
                 raw_meta.get("table_type") == "ICEBERG" 
                 or "iceberg" in serde_lib.lower() 
                 or "iceberg" in all_keys_str
+                or "table properties" in all_keys_str
             )
             is_trino = "trino_version" in all_keys_str
 
@@ -330,17 +339,18 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
 
             # --- 2. EXTRAÇÃO DE METADADOS ADICIONAIS ---
             owner = "UNKNOWN"
-            for k, v in raw_meta.items():
-                if "owner" in k:
-                    # Remove possíveis sobras de formatação visual do terminal (ex: USER, ou delimitadores)
-                    clean_val = v.replace("USER", "").strip(", ").strip()
-                    if clean_val and clean_val.upper() != "NULL":
-                        owner = clean_val
-                        break
-                    
-            # Fallback secundário usando busca por substring se o mapeamento exato falhar
+            try:
+                owner = spark.catalog.getTable(f"`{db_name}`.`{table_name}`").owner or "UNKNOWN"
+            except Exception:
+                pass
+                
             if owner == "UNKNOWN":
-                owner = find_val("owner") or "UNKNOWN"
+                for k, v in raw_meta.items():
+                    if "owner" in k:
+                        clean_val = v.replace("USER", "").strip(", ").strip()
+                        if clean_val and clean_val.upper() != "NULL":
+                            owner = clean_val
+                            break
             
             # Captura estatísticas reais de linhas (numRows mapeado do Table Parameters)
             num_rows = raw_meta.get("numrows") or raw_meta.get("num_rows") or "0"
@@ -666,7 +676,7 @@ def run_iceberg_maintenance(spark: SparkSession, table_name: str) -> None:
         logger.info("- Expirando snapshots antigos (> 30 dias)...")
         import time
         older_than_ms = int((time.time() - (30 * 24 * 60 * 60)) * 1000)
-        spark.sql(f"CALL spark_catalog.system.expire_snapshots(table => '{table_name}', older_than => TIMESTAMP WITH LOCAL TIME ZONE FROM_UNIXTIME({older_than_ms / 1000}))")
+        spark.sql(f"CALL spark_catalog.system.expire_snapshots(table => '{table_name}', older_than => TIMESTAMP(FROM_UNIXTIME({older_than_ms / 1000})))")
 
         logger.info("Manutenção finalizada com sucesso.")
 
