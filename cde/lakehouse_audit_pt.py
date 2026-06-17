@@ -262,14 +262,17 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
             # 2. Consulta o Describe Extended e constrói um dicionário ultra-normalizado
             desc_df = spark.sql(f"DESCRIBE EXTENDED `{db_name}`.`{table_name}`")
             raw_meta = {}
-
+            
+            # --- CAPTURA E HIGIENIZAÇÃO DOS CAMPOS EM LOOP ---
             for r in desc_df.collect():
                 col = str(r["col_name"] or "").strip()
                 val = str(r["data_type"] or "").strip()
 
                 # Normaliza caracteres invisíveis (\u00a0) muito comuns no HMS da Cloudera
                 col_norm = col.replace("\u00a0", " ").replace(":", "").strip().lower()
-                val_norm = val.replace("\u00a0", " ").strip()
+                
+                # Limpeza do valor eliminando delimitadores de terminal (, e NULL)
+                val_norm = val.replace("\u00a0", " ").replace(",NULL", "").replace("NULL", "").strip(", ").strip()
 
                 if col_norm and not col_norm.startswith("#"):
                     raw_meta[col_norm] = val_norm
@@ -278,7 +281,7 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
                     parts = [p.strip() for p in val_norm.replace("\t", " ").split(" ") if p.strip()]
                     if len(parts) >= 2:
                         k_sub = parts[0].replace(":", "").strip().lower()
-                        v_sub = " ".join(parts[1:]).strip()
+                        v_sub = " ".join(parts[1:]).strip(", ").strip()
                         raw_meta[k_sub] = v_sub
                         
             # VERBOSE / DEBUG: Imprime o dicionário mapeado da tabela alvo para auditoria visual no log do CDE
@@ -328,9 +331,13 @@ def get_catalog_metadata(spark: SparkSession) -> StructType:
             # --- 2. EXTRAÇÃO DE METADADOS ADICIONAIS ---
             owner = "UNKNOWN"
             for k, v in raw_meta.items():
-                if k.strip() == "owner":
-                    owner = v.strip()
-                    break
+                if "owner" in k:
+                    # Remove possíveis sobras de formatação visual do terminal (ex: USER, ou delimitadores)
+                    clean_val = v.replace("USER", "").strip(", ").strip()
+                    if clean_val and clean_val.upper() != "NULL":
+                        owner = clean_val
+                        break
+                    
             # Fallback secundário usando busca por substring se o mapeamento exato falhar
             if owner == "UNKNOWN":
                 owner = find_val("owner") or "UNKNOWN"
