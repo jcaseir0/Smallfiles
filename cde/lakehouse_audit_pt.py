@@ -26,7 +26,7 @@ import logging, sys, os
 from datetime import datetime
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.types import StructType, StructField, StringType, LongType, DoubleType, TimestampType
+from pyspark.sql.types import StructType, StructField, StringType, LongType, DoubleType, TimestampType, DateType
 from concurrent.futures import ThreadPoolExecutor
 
 # 1. Configuração de Logging (Melhor prática para Verbose no CDE)
@@ -578,10 +578,34 @@ def aggregate_and_save(df_raw_files, df_catalog_meta, target_table_name: str, th
         "location", "metadata_location", "create_time", "last_access", "audit_timestamp", "audit_date"
     ]
 
-    df_persistence = df_calculated.select([F.col(c).cast(StringType() if c not in ["total_files_count", "total_size_bytes", "small_files_count", "avg_file_size_bytes", "small_files_pct", "audit_timestamp", "audit_date"] else 
-                                                    (LongType() if c in ["total_files_count", "total_size_bytes", "small_files_count"] else 
-                                                     (DoubleType() if c in ["avg_file_size_bytes", "small_files_pct"] else 
-                                                      (TimestampType() if c == "audit_timestamp" else F.coalesce())))) for c in final_column_order])
+    # 4. Mapeamento estrito de tipos para persistência correta na tabela Iceberg
+    type_mapping = {
+        "uuid": StringType(),
+        "owner": StringType(),
+        "db_name": StringType(),
+        "table_name": StringType(),
+        "table_type": StringType(),
+        "write_format": StringType(),
+        "partitioning_type": StringType(),
+        "partitioning_cols": StringType(),
+        "num_rows": StringType(),
+        "total_files_count": LongType(),
+        "total_size_bytes": LongType(),
+        "small_files_count": LongType(),
+        "avg_file_size_bytes": DoubleType(),
+        "small_files_pct": DoubleType(),
+        "location": StringType(),
+        "metadata_location": StringType(),
+        "create_time": StringType(),
+        "last_access": StringType(),
+        "audit_timestamp": TimestampType(),
+        "audit_date": DateType(),
+    }
+
+    # Aplica o cast mapeando dinamicamente cada coluna de forma segura
+    df_persistence = df_calculated.select([
+        F.col(c).cast(type_mapping[c]) for c in final_column_order
+    ])
 
     try:
         target_db = target_table_name.split(".")[0]
